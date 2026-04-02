@@ -1,0 +1,64 @@
+cff-version: 1.2.0
+
+title: "TriageSim: A Conversational Emergency Triage Simulation Framework from Structured Electronic Health Records"
+
+message: >
+  If you use this software or dataset in your research, please cite it as below.
+
+authors:
+  - family-names: Srirag
+    given-names: Dipankar
+    affiliation: University of New South Wales
+  - family-names: Nguyen
+    given-names: Quoc Dung
+  - family-names: Joshi
+    given-names: Aditya
+  - family-names: Narasimhan
+    given-names: Padmanesan
+  - family-names: Kanhere
+    given-names: Salil
+
+version: 0.1.0
+
+date-released: 2026-01-01
+
+license: MIT
+
+repository-code: https://github.com/dipankarsrirag/triage-sim
+
+abstract: >
+  TriageSim is an open-source speech and dialogue simulation framework for
+  emergency department triage. It generates paired structured EHR → dialogue →
+  accented speech data, enabling controlled evaluation of speech and language
+  systems in healthcare. The framework supports multi-speaker persona-conditioned
+  dialogue generation, phrase-break annotation for TTS, and accent-varied speech
+  synthesis grounded in real-world clinical vignettes from MIMIC-IV-ED, ATS,
+  and ETEK datasets.
+
+keywords:
+  - emergency medicine
+  - triage
+  - spoken dialogue simulation
+  - speech synthesis
+  - multi-speaker
+  - accented speech
+  - healthcare NLP
+  - large language models
+
+preferred-citation:
+  type: article
+  title: "TriageSim: A Conversational Emergency Triage Simulation Framework from Structured Electronic Health Records"
+  authors:
+    - family-names: Srirag
+      given-names: Dipankar
+      affiliation: University of New South Wales
+    - family-names: Nguyen
+      given-names: Quoc Dung
+    - family-names: Joshi
+      given-names: Aditya
+    - family-names: Narasimhan
+      given-names: Padmanesan
+    - family-names: Kanhere
+      given-names: Salil
+  url: "https://arxiv.org/abs/2603.10035"
+  year: 2026

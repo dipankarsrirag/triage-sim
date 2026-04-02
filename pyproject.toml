@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triagesim"
+version = "0.1.0"
+description = "Multi-speaker spoken dialogue simulation framework for emergency department triage"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Dipankar Srirag", email = "d.srirag@unsw.edu.au" },
+]
+keywords = [
+    "triage",
+    "simulation",
+    "dialogue",
+    "speech",
+    "NLP",
+    "healthcare",
+    "emergency medicine",
+    "spoken dialogue",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-ai[openrouter]>=1.0",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+redis = ["redis>=5.0"]
+audio = ["torch>=2.0", "TTS>=0.22"]
+dev = [
+    "pytest>=8.0",
+    "triagesim[redis]",
+]
+
+[project.urls]
+Homepage = "https://github.com/dipankarsrirag/triage-sim"
+Repository = "https://github.com/dipankarsrirag/triage-sim"
+Issues = "https://github.com/dipankarsrirag/triage-sim/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["triagesim*"]
+
+[tool.setuptools.package-data]
+triagesim = ["py.typed"]
