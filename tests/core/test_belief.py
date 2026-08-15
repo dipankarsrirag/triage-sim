@@ -1,6 +1,6 @@
 import pytest
 
-from triagesim.core.belief_graph import BeliefGraph
+from triagesim.core.belief_graph import BeliefGraph, BeliefSlotUpdate
 from triagesim.core.belief_updater import BeliefUpdater
 
 
@@ -16,25 +16,22 @@ def graph():
 
 @pytest.fixture
 def updater():
-    # LLM disabled by default
     return BeliefUpdater()
 
 
 # ─────────────────────────────────────────
-# Tests: utterances (LLM disabled)
+# Tests: externally-produced updates
+#
+# The updater performs NO inference of its own; updates are produced
+# upstream (e.g. by NurseAgent.infer_belief_updates) and applied here.
 # ─────────────────────────────────────────
 
 
-def test_patient_utterance_no_llm_no_change(graph, updater):
+def test_no_updates_leaves_graph_untouched(graph, updater):
     """
-    Patient utterance should NOT update belief when LLM is disabled.
+    Applying an empty update list must not mutate the graph.
     """
-    updater.update_from_utterance(
-        graph=graph,
-        text="I have severe chest pain",
-        source="patient",
-        turn=0,
-    )
+    updater.apply_updates(graph=graph, updates=[])
 
     assert graph.slot_values == {}
     assert graph.evidence_nodes == {}
@@ -43,20 +40,28 @@ def test_patient_utterance_no_llm_no_change(graph, updater):
     assert graph.red_flags_logged == set()
 
 
-def test_nurse_utterance_no_llm_no_change(graph, updater):
+def test_apply_updates_records_slot_and_evidence(graph, updater):
     """
-    Nurse utterance should NOT update belief when LLM is disabled.
+    An externally-produced update should land in the graph with provenance.
     """
-    updater.update_from_utterance(
+    updater.apply_updates(
         graph=graph,
-        text="What is the patient's blood pressure?",
-        source="nurse",
-        turn=1,
+        updates=[
+            BeliefSlotUpdate(
+                slot="chief_complaint",
+                value="chest pain",
+                evidence="I have severe chest pain",
+                source="patient",
+                turn=0,
+                certainty="explicit",
+            )
+        ],
     )
 
-    assert graph.slot_values == {}
-    assert graph.evidence_nodes == {}
-    assert graph.edges == {}
+    assert graph.slot_values["chief_complaint"][0]["value"] == "chest pain"
+    assert graph.slot_values["chief_complaint"][0]["certainty"] == "explicit"
+    assert len(graph.evidence_nodes) == 1
+    assert "chief_complaint" in graph.edges
 
 
 # ─────────────────────────────────────────

@@ -1,5 +1,6 @@
 import pytest
 
+from triagesim.core.belief_graph import BeliefSlotUpdate
 from triagesim.core.environment import TriageEnv, NURSE, PATIENT
 from triagesim.core.output_schema import NurseOutput, PatientOutput
 from triagesim.core.state_store import StateStore
@@ -31,6 +32,38 @@ class InMemoryStateStore(StateStore):
 
 
 # ─────────────────────────────────────────
+# Mock nurse agent
+#
+# The environment calls back into the nurse agent to infer belief updates
+# from patient utterances. This mock does keyword matching instead of an LLM.
+# ─────────────────────────────────────────
+
+
+class MockNurseAgent:
+    def __init__(self):
+        self.seen_vital = False
+        self.logged_flag = False
+
+    def infer_belief_updates(self, history, last_utterance, turn):
+        updates = []
+
+        for keyword in ("breath", "dizzy", "pain"):
+            if keyword in last_utterance.lower():
+                updates.append(
+                    BeliefSlotUpdate(
+                        slot="associated_symptom",
+                        value=keyword,
+                        evidence=last_utterance,
+                        source="patient",
+                        turn=turn,
+                        certainty="explicit",
+                    )
+                )
+
+        return updates
+
+
+# ─────────────────────────────────────────
 # Fixtures
 # ─────────────────────────────────────────
 
@@ -52,10 +85,11 @@ def ground_truth():
 
 @pytest.fixture
 def env():
-    store = InMemoryStateStore()
-    env = TriageEnv(store=store, max_turns=5)
-    env.belief_updater.enable_llm = True
-    return env
+    return TriageEnv(
+        store=InMemoryStateStore(),
+        nurse_agent=MockNurseAgent(),
+        max_turns=5,
+    )
 
 
 @pytest.fixture
@@ -81,7 +115,9 @@ def test_nurse_utterance_step(env, run_id):
     obs, done = env.step(run_id, NURSE, nurse_action)
 
     assert not done
-    assert obs["state"]["turn"] == 1
+
+    # Nurse actions are micro-turns: only the patient advances the turn counter.
+    assert obs["state"]["turn"] == 0
 
     history = obs["history"]
     assert history[-1]["actor"] == "nurse"
@@ -91,7 +127,7 @@ def test_nurse_utterance_step(env, run_id):
     assert belief is not None
 
 
-def test_patient_response_updates_belief(env, run_id):
+def test_patient_response_advances_turn_and_updates_belief(env, run_id):
     # Nurse asks
     env.step(
         run_id,
@@ -112,9 +148,9 @@ def test_patient_response_updates_belief(env, run_id):
     obs, done = env.step(run_id, PATIENT, patient_action)
 
     assert not done
+    assert obs["state"]["turn"] == 1
 
-    belief = obs["belief"]
-    symptoms = belief["associated_symptoms"]
+    symptoms = obs["belief"]["associated_symptoms"]
 
     assert len(symptoms) > 0
     assert any("breath" in s["value"].lower() for s in symptoms)
@@ -165,6 +201,22 @@ def test_log_red_flag(env, run_id):
     assert any("respiratory" in rf["value"].lower() for rf in belief["red_flags"])
 
 
+def test_duplicate_red_flags_are_logged_once(env, run_id):
+    nurse_action = NurseOutput(
+        action="log_red_flag",
+        utterance=None,
+        triage=2,
+        red_flags=["severe respiratory distress"],
+        confidence="high",
+        explanation="Marked tachypnea and hypoxia",
+    )
+
+    env.step(run_id, NURSE, nurse_action)
+    obs, _ = env.step(run_id, NURSE, nurse_action)
+
+    assert obs["red_flags"].count("severe respiratory distress") == 1
+
+
 def test_end_action_terminates_episode(env, run_id):
     nurse_action = NurseOutput(
         action="end",
@@ -185,19 +237,52 @@ def test_end_action_terminates_episode(env, run_id):
 
 
 def test_max_turns_termination(env, run_id):
+    # Only patient steps advance the turn counter, so termination is
+    # driven by patient responses rather than nurse micro-turns.
     for _ in range(env.max_turns):
         env.step(
             run_id,
-            NURSE,
-            NurseOutput(
-                action="utterance",
-                utterance="Tell me more.",
-                triage=3,
-                red_flags=[],
-                confidence="low",
-                explanation="Continuing assessment",
-            ),
+            PATIENT,
+            PatientOutput(utterance="I still feel unwell."),
         )
 
     obs = env.observe(run_id)
     assert obs["state"]["done"] is True
+
+
+def test_step_after_done_is_a_noop(env, run_id):
+    env.step(
+        run_id,
+        NURSE,
+        NurseOutput(
+            action="end",
+            utterance=None,
+            triage=2,
+            red_flags=[],
+            confidence="high",
+            explanation="Done",
+        ),
+    )
+
+    before = env.observe(run_id)["history"]
+
+    obs, done = env.step(
+        run_id,
+        NURSE,
+        NurseOutput(
+            action="utterance",
+            utterance="One more question?",
+            triage=3,
+            red_flags=[],
+            confidence="low",
+            explanation="Should be ignored",
+        ),
+    )
+
+    assert done
+    assert obs["history"] == before
+
+
+def test_wrong_output_type_for_actor_raises(env, run_id):
+    with pytest.raises(TypeError):
+        env.step(run_id, NURSE, PatientOutput(utterance="I am the patient."))

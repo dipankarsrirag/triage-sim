@@ -1,6 +1,7 @@
 import pytest
 from typing import List
 
+from triagesim.core.belief_graph import BeliefSlotUpdate
 from triagesim.runner import TriageRunner, RunnerConfig
 from triagesim.core.output_schema import NurseOutput, PatientOutput
 
@@ -19,7 +20,11 @@ class MockNurseAgent:
         self.actions = actions
         self.idx = 0
 
-    def act(self, history: str) -> NurseOutput:
+        # Per-phase flags the runner sets/reads
+        self.seen_vital = False
+        self.logged_flag = False
+
+    def act(self, history: str, known_vitals: set) -> NurseOutput:
         if self.idx >= len(self.actions):
             # Default safe termination
             return NurseOutput(
@@ -34,6 +39,27 @@ class MockNurseAgent:
         self.idx += 1
         return out
 
+    def infer_belief_updates(
+        self,
+        history: str,
+        last_utterance: str,
+        turn: int,
+    ) -> List[BeliefSlotUpdate]:
+        """Deterministic stand-in for LLM-backed belief inference."""
+        if "breath" not in last_utterance.lower():
+            return []
+
+        return [
+            BeliefSlotUpdate(
+                slot="associated_symptom",
+                value="shortness of breath",
+                evidence=last_utterance,
+                source="patient",
+                turn=turn,
+                certainty="explicit",
+            )
+        ]
+
 
 class MockPatientAgent:
     """
@@ -44,7 +70,7 @@ class MockPatientAgent:
         self.utterances = utterances
         self.idx = 0
 
-    def act(self, history: str) -> PatientOutput:
+    def act(self, history: str, chief_complaint: str, pain: int) -> PatientOutput:
         if self.idx >= len(self.utterances):
             return PatientOutput(utterance="I have nothing else to add.")
         u = self.utterances[self.idx]
@@ -67,6 +93,7 @@ def ground_truth():
             "sbp": 100,
             "temperature": 37.8,
         },
+        "chiefcomplaint": "shortness of breath",
         "acuity": 2,
         "pain": 6,
     }
