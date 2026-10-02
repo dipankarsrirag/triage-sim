@@ -1,0 +1,8 @@
+{"case_id": "syncope-01", "chief_complaint": "Syncope", "vitals": {"temperature": 99.1, "heartrate": 112, "resprate": 26, "o2sat": 91, "sbp": 98}, "acuity": 2, "pain": 7}
+{"case_id": "chest-pain-01", "chief_complaint": "Chest pain radiating to left arm", "vitals": {"temperature": 98.4, "heartrate": 104, "resprate": 20, "o2sat": 96, "sbp": 158}, "acuity": 2, "pain": 8}
+{"case_id": "ankle-01", "chief_complaint": "Right ankle injury after a fall", "vitals": {"temperature": 98.2, "heartrate": 84, "resprate": 16, "o2sat": 99, "sbp": 128}, "acuity": 4, "pain": 6}
+{"case_id": "asthma-01", "chief_complaint": "Shortness of breath, wheezing", "vitals": {"temperature": 98.9, "heartrate": 118, "resprate": 28, "o2sat": 90, "sbp": 132}, "acuity": 2, "pain": 3}
+{"case_id": "headache-01", "chief_complaint": "Headache", "vitals": {"temperature": 98.6, "heartrate": 76, "resprate": 14, "o2sat": 99, "sbp": 122}, "acuity": 3, "pain": 5}
+{"case_id": "rash-01", "chief_complaint": "Rash", "vitals": {"temperature": 98.4, "heartrate": 72, "resprate": 14, "o2sat": 100, "sbp": 118}, "acuity": 5, "pain": 1}
+{"case_id": "abd-pain-01", "chief_complaint": "Abdominal pain, vomiting", "vitals": {"temperature": 100.9, "heartrate": 108, "resprate": 18, "o2sat": 98, "sbp": 110}, "acuity": 3, "pain": 8}
+{"case_id": "laceration-01", "chief_complaint": "Finger laceration", "vitals": {"temperature": 98.1, "heartrate": 88, "resprate": 16, "o2sat": 99, "sbp": 130}, "acuity": 4, "pain": 4}

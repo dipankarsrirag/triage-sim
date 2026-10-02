@@ -1,0 +1,35 @@
+# Patient personas (traits and levels: triagesim/personas.py, docs/persona-traits-review.md).
+# Gender comes from the case. scripts/generate_personas.py generates the full combinatorial pool.
+- age_group: adult
+  english_proficiency: fluent
+  health_literacy: adequate
+  recall_reliability: reliable
+  symptom_reporting: faithful
+  distress: anxious
+  disclosure: open
+  demeanour: cooperative
+  verbosity: typical
+  focus: on_target
+  disfluency: low
+- age_group: older
+  english_proficiency: functional
+  health_literacy: limited
+  recall_reliability: patchy
+  symptom_reporting: minimising
+  distress: calm
+  disclosure: selective
+  demeanour: cooperative
+  verbosity: expansive
+  focus: frequent_tangents
+  disfluency: high
+- age_group: adult
+  english_proficiency: fluent
+  health_literacy: marginal
+  recall_reliability: reliable
+  symptom_reporting: amplifying
+  distress: highly_distressed
+  disclosure: guarded
+  demeanour: impatient
+  verbosity: terse
+  focus: on_target
+  disfluency: moderate
