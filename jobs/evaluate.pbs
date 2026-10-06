@@ -2,6 +2,9 @@
 # Triage evaluation on the seed datasets in data/ (see scripts/evaluate.py), run from the repo root:
 #   qsub -v MODEL=/srv/scratch/z5437514/models/gemma-4-E4B-it,OUT=outputs/eval/gemma4 jobs/evaluate.pbs
 # Pairing: NURSE_MODEL / PATIENT_MODEL take full specs (vllm:<path> or openrouter:<id>) instead of MODEL.
+# Several runs in one job (vLLM start-up costs minutes per job): RUNS=a:b runs evaluate.py once per
+# a.args, b.args (argument files with the models and flags), writing to $OUT/a, $OUT/b:
+#   qsub -v RUNS=gemma-qwen:qwen-gemma,OUT=outputs/eval/pairs jobs/evaluate.pbs
 #PBS -N triagesim-eval
 #PBS -l select=1:ncpus=8:ngpus=1:mem=64gb:gpu_model=H200
 #PBS -l walltime=02:00:00
@@ -38,4 +41,13 @@ export PYTHONPATH=$PBS_O_WORKDIR:$PYTHONPATH   # prepend: the modules put their 
 if [ -n "$MODEL" ]; then MODELS=(--model "vllm:$MODEL"); else MODELS=(--nurse-model "$NURSE_MODEL" --patient-model "$PATIENT_MODEL"); fi
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+if [ -n "$RUNS" ]; then
+    IFS=':' read -r -a NAMES <<< "$RUNS"
+    status=0
+    for name in "${NAMES[@]}"; do   # one failed run does not stop the others
+        echo "=== run $name"
+        python3 scripts/evaluate.py --out-dir "$OUT/$name" "@$name.args" || status=1
+    done
+    exit $status
+fi
 python3 scripts/evaluate.py "${MODELS[@]}" --out-dir "$OUT" $ARGS

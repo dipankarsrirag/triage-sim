@@ -39,7 +39,7 @@ trap cleanup EXIT
 cd "$PBS_O_WORKDIR"
 # --------------------------------------- job ---------------------------------------
 export PYTHONPATH=$PBS_O_WORKDIR:$PYTHONPATH   # prepend: the modules put their packages here
-MODEL=${MODEL:-/srv/scratch/z5437514/models/Qwen3.5-0.8B}
+: "${MODEL:?qsub -v MODEL=/srv/scratch/z5437514/models/<name> jobs/smoke_test.pbs}"
 OUT=outputs/smoke-${PBS_JOBID%%.*}
 mkdir -p "$OUT"
 COMMON=(--cases examples/cases.jsonl
@@ -76,5 +76,5 @@ ep = json.loads(open(sys.argv[1]).readline())
 print(ep["episode_id"], "| ground truth", ep["case"]["acuity"], "| final", ep["final_triage"], "|", ep["end_reason"])
 print(transcript(ep["history"]))
 print("red flags:", ep["red_flags"])
-print("beliefs:", json.dumps(ep["beliefs"][:2], indent=1))
+print("record:", json.dumps(ep["record"], indent=1))
 EOF

@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from triagesim.schemas import BeliefExtraction, NurseOutput, PatientOutput, nurse_output_type
+from triagesim.schemas import RECORD_FIELDS, NurseOutput, PatientOutput, Reading, nurse_output_type
 
 BASE = {"understood": None, "vital": None, "utterance": None, "triage": 3, "confidence": "low", "red_flags": [], "explanation": "x"}
 
@@ -38,7 +38,6 @@ def test_narrowed_type_rejects_disallowed_action():
     [
         {"action": "utterance", "utterance": "  "},
         {"action": "check_vital", "vital": None},
-        {"action": "log_red_flag", "red_flags": [" "]},
     ],
 )
 def test_payload_must_match_action(fields):
@@ -56,9 +55,12 @@ def test_blank_patient_utterance_is_rejected():
         PatientOutput(utterance=" ", disclosed="nothing")
 
 
-def test_belief_extraction_schema_is_strict():
-    schema = BeliefExtraction.model_json_schema()
-    assert set(schema["required"]) == set(schema["properties"])
+def test_reading_schema_is_strict_and_holds_every_record_field():
+    schema = Reading.model_json_schema()
+    assert set(schema["required"]) == set(schema["properties"]) == {"conveyed", "record"}
+    record = schema["$defs"]["TriageRecord"]  # the full record, every field written out
+    assert set(record["required"]) == set(record["properties"]) == set(RECORD_FIELDS)
+    assert all(f["type"] == "string" for f in record["properties"].values()) and record["additionalProperties"] is False
 
 
 def test_understood_is_required_only_when_reading():
@@ -66,3 +68,9 @@ def test_understood_is_required_only_when_reading():
     skip = nurse_output_type(("utterance", "end"), (), False).model_json_schema()["properties"]
     assert read["understood"]["type"] == "string" and skip["understood"]["type"] == "null"
     assert list(read)[:2] == ["understood", "action"]  # read before acting
+
+
+def test_an_empty_red_flag_log_is_allowed():
+    out = NurseOutput(understood=None, action="log_red_flag", vital=None, utterance=None, red_flags=[],
+                      explanation="x", triage=3, confidence="low")
+    assert out.red_flags == []  # logs nothing instead of failing the episode

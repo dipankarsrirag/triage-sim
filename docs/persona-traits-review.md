@@ -455,6 +455,9 @@ and acuity (P1).
   - Observability: U. Correlate with age and cognitive state.
 - `disfluency` (kept): *low* / *moderate* / *high*.
   - Specify fillers and repairs separately; they pattern differently (Bortfeld 2001).
+  - The patient prompt names five types (2026-10-03, user): repetitions, filled pauses, insertions,
+    substitutions and speech errors, written as spoken (dashes for break-offs, no "..."); the level
+    sets how often they occur.
   - Observability: U. Correlate with limited English, impairment and distress.
 
 **TTS only (hidden from LLMs):** ethnicity or accent, and `instruction`. This matches the current

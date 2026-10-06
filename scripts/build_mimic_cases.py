@@ -8,12 +8,14 @@ analysis only: triagesim never shows them to the models.
 
 Stays are either listed in --stays (any CSV with a stay_id column; its specialisation column is kept
 if present) or drawn from every eligible stay: acuity recorded, chief complaint present and not
-redacted ("___"), all five vitals present and physiologically plausible, and pain a number from 0 to
-10. --per-acuity samples up to N stays per acuity level; --sample draws N at random (the natural
-acuity mix).
+redacted ("___"), recorded vitals physiologically plausible (missing ones are kept as missing, as
+in real triage: the nurse then has to infer them from the patient), and pain a number from 0 to 10.
+--no-ambulance-esi1 drops ESI-1 stays that arrived by ambulance (they go straight to resuscitation).
+--per-acuity samples up to N stays per acuity level; --sample draws N at random (the natural acuity
+mix).
 
-    python scripts/build_mimic_cases.py --mimic-dir /path/to/mimic-iv-ed --per-acuity 2000 \
-        --out data/cases/mimic.jsonl
+    python scripts/build_mimic_cases.py --mimic-dir /path/to/mimic-iv-ed --per-acuity 1000 \
+        --no-ambulance-esi1 --out data/cases/mimic.jsonl
 """
 
 import argparse
@@ -37,7 +39,7 @@ def eligible(triage: pd.DataFrame) -> pd.Series:
     ok = triage["acuity"].notna() & complaint.notna() & ~complaint.astype(str).str.contains("___", regex=False)
     ok &= pd.to_numeric(triage["pain"], errors="coerce").between(0, 10)
     for name, (low, high) in PLAUSIBLE.items():
-        ok &= triage[name].between(low, high)  # also drops missing vitals
+        ok &= triage[name].isna() | triage[name].between(low, high)  # missing is kept; implausible is an error
     return ok
 
 
@@ -47,6 +49,7 @@ def main():
     p.add_argument("--stays", help="CSV with a stay_id column (default: every eligible stay)")
     p.add_argument("--per-acuity", type=int, help="sample up to N eligible stays per acuity level")
     p.add_argument("--sample", type=int, help="sample N eligible stays at random")
+    p.add_argument("--no-ambulance-esi1", action="store_true", help="drop ESI-1 stays that arrived by ambulance")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", required=True)
     args = p.parse_args()
@@ -60,6 +63,10 @@ def main():
     else:
         selection = pd.DataFrame()
         pool = triage[eligible(triage)]
+        if args.no_ambulance_esi1:
+            arrival = pd.read_csv(root / "edstays.csv", usecols=["stay_id", "arrival_transport"])
+            ambulance = set(arrival.loc[arrival["arrival_transport"] == "AMBULANCE", "stay_id"])
+            pool = pool[~((pool["acuity"] == 1) & pool["stay_id"].isin(ambulance))]
         if args.per_acuity:
             triage = pool.sample(frac=1, random_state=args.seed).groupby("acuity").head(args.per_acuity)
         elif args.sample:

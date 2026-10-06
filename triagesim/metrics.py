@@ -32,6 +32,7 @@ def score(episode: dict) -> dict[str, Any]:
         "verified_utterances": len(checks),
         "regenerated_utterances": sum(bool(c["rejected"]) for c in checks),
         "flagged_utterances": sum(c["passed"] is False for c in checks),
+        "edited_utterances": sum(bool(c.get("edited")) for c in checks),
     }
 
 
@@ -59,4 +60,5 @@ def summarize(episodes: Iterable[dict]) -> dict[str, Any]:
         "mean_vitals": avg("num_vitals"),
         "regenerated_rate": sum(s["regenerated_utterances"] for s in scores) / verified if verified else None,
         "flagged_rate": sum(s["flagged_utterances"] for s in scores) / verified if verified else None,
+        "edited_rate": sum(s["edited_utterances"] for s in scores) / verified if verified else None,
     }

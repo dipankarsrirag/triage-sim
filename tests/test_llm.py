@@ -1,3 +1,6 @@
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import openai
@@ -124,3 +127,23 @@ def test_openrouter_response_without_choices_is_retryable(fake_openai):
     fake_openai.responses = [SimpleNamespace(choices=None, usage=None), response('{"utterance": "ok"}')]
     [out] = generate(OpenRouter("m"), [req()])
     assert out.utterance == "ok"
+
+
+def test_openrouter_caps_requests_in_flight_across_concurrent_calls(fake_openai):
+    backend = OpenRouter("m", max_workers=3)
+    lock, in_flight, peak = threading.Lock(), [0], [0]
+
+    def create(**kwargs):
+        with lock:
+            in_flight[0] += 1
+            peak[0] = max(peak[0], in_flight[0])
+        time.sleep(0.02)
+        with lock:
+            in_flight[0] -= 1
+        return response('{"utterance": "hi"}')
+
+    backend.client.chat.completions.create = create
+    with ThreadPoolExecutor(4) as pool:  # e.g. four episodes, each sending its own call
+        list(pool.map(lambda _: backend.complete([req()] * 4), range(4)))
+    assert peak[0] == 3
+    assert backend.usage["calls"] == 16

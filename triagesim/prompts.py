@@ -1,5 +1,5 @@
 """
-Prompt construction for the nurse, the patient and belief extraction.
+Prompt construction for the nurse, the patient and the dialogue master.
 
 Static instructions (algorithm, persona, output format) go in the system message and the per-turn
 state (transcript, known vitals, allowed actions) in the user message, so every request of an
@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from triagesim.cases import Case
 from triagesim.personas import CASE_STATES, PatientPersona, Trait, traits_of
-from triagesim.schemas import PatientScript
+from triagesim.schemas import RECORD_FIELDS, RECORD_UNKNOWN, VITALS, PatientScript
 
 RULE = "────────────────────────────────────────"
 
@@ -52,9 +52,29 @@ def _vital(name: str, v: Optional[float]) -> str:
     return f"{v:g}{unit}"
 
 
-def _vitals_known(history: list[dict]) -> str:
-    known = sorted(h["name"] for h in history if h.get("event") == "vital")
-    return "\n".join(f"- {v} (obtained)" for v in known) or "- None obtained yet"
+# what to ask the patient about to infer a vital sign that cannot be measured
+VITAL_SYMPTOMS = {
+    "temperature": "fever, chills or feeling hot or cold",
+    "heartrate": "a racing or pounding heart, palpitations or dizziness",
+    "resprate": "shortness of breath or breathing fast",
+    "o2sat": "breathlessness, trouble breathing or blue lips",
+    "sbp": "dizziness, light-headedness, fainting or weakness",
+}
+
+
+def _record(record: Optional[dict], history: list[dict]) -> str:
+    """The nurse's triage record: what the dialogue master noted from the dialogue, the vital signs
+    taken so far, and those that could not be measured."""
+    lines = [f"- {name.replace('_', ' ')}: {(record or {}).get(name) or RECORD_UNKNOWN}" for name in RECORD_FIELDS]
+    tried = {h["name"]: h for h in history if h.get("event") == "vital"}
+    taken = [f"{name} {_vital(name, tried[name]['value'])}" for name in VITALS
+             if name in tried and tried[name].get("measurable", True)]
+    missing = [name for name in VITALS if name not in tried]
+    lines.append(f"- vital signs: {'; '.join(taken) or 'none taken yet'}"
+                 + (f" (not yet taken: {', '.join(missing)})" if missing else ""))
+    lines += [f"- {name}: could not be measured; infer it from the patient's answers (ask about {VITAL_SYMPTOMS[name]})"
+              for name in VITALS if name in tried and not tried[name].get("measurable", True)]
+    return "\n".join(lines)
 
 
 def patient_view(case: Case, persona: PatientPersona) -> str:
@@ -74,11 +94,23 @@ def transcript(history: list[dict]) -> str:
             lines.append(f"Nurse: {h['utterance']}")
         elif h["actor"] == "patient":
             lines.append(f"Patient: {h['utterance']}")
+        elif h["event"] == "vital" and h.get("measurable") is False:
+            lines.append(f"[Vital] {h['name']}: could not be measured")
         elif h["event"] == "vital":
             lines.append(f"[Vital] {h['name']} = {_vital(h['name'], h['value'])}")
         elif h["event"] == "triage_end":
             lines.append("[Triage ended]")
     return "\n".join(lines)
+
+
+def spoken_transcript(history: list[dict]) -> list[dict[str, str]]:
+    """The output transcript: the spoken nurse and patient lines only, without system events and
+    without lines kept for the agents alone (e.g. announcing a vital that could not be measured)."""
+    return [
+        {"speaker": h["actor"], "text": h["utterance"]}
+        for h in history
+        if h["actor"] in ("nurse", "patient") and h.get("in_transcript", True)
+    ]
 
 
 # ─────────────────────────────────────────
@@ -293,7 +325,9 @@ You MUST output a single JSON object with EXACTLY the following fields:
 
 - utterance:
     What you say to the patient: a single short question or statement, as said aloud at a
-    triage desk (about 20 words at most). Null only if action is "log_red_flag" or "end".
+    triage desk (about 20 words at most). Never use names: do not introduce yourself by name,
+    and do not ask for or use the patient's name. With "end", a brief closing line (see "end").
+    Null only if action is "log_red_flag".
 
 - red_flags:
     A list of red flags you have identified SO FAR.
@@ -315,7 +349,7 @@ You MUST output a single JSON object with EXACTLY the following fields:
     in the CURRENT triage estimate.
 
 Do NOT reference information that has not been stated or observed.
-Do NOT overload with information. Ask one single question.
+Do NOT overload with information. Ask one single question, not two joined by "and".
 Do NOT invent vital signs or diagnoses.
 Do NOT include any text outside the JSON object.
 Base all decisions strictly on available information.
@@ -331,7 +365,11 @@ ACTION_HELP = {
     "check_vital": """
 - "check_vital":
     Request ONE specific vital sign from the following list ONLY: {vitals}
-    Set "vital" to the one you request.
+    You can take one vital sign before each question, as the conversation makes it relevant
+    (and any you still need after your last question); do not take them all at once.
+    Set "vital" to the one you request, and "utterance" to what you say as you take it: a
+    short, plain statement such as "Let me check your blood pressure.", not a question, with
+    no reason given and no technical terms.
     Do NOT request a vital sign that has already been obtained.
     Do NOT assume the result until it is provided.""",
     "log_red_flag": """
@@ -352,10 +390,14 @@ ACTION_HELP = {
     Each red flag must be supported by specific evidence from the dialogue.""",
     "end": """
 - "end":
-    End the triage interaction when you believe sufficient information has
-    been gathered to assign a triage category.
-    You should only choose this when no further clarification or vital signs
-    are required.""",
+    End the triage and give your final triage level once you have enough
+    information, including the vital signs you need, to assign it. A triage
+    interview usually covers the presenting complaint, its onset and course,
+    pain, relevant history, medications and allergies; your triage record shows
+    what is still missing. Ask what this patient's triage needs before you end.
+    You do not have to use all your questions. Set "utterance" to a brief closing
+    line to the patient (e.g. thanks and what happens next), not a question, and
+    never mention the triage level.""",
 }
 
 
@@ -381,24 +423,48 @@ def nurse_messages(
     history: list[dict],
     actions: tuple[str, ...],
     vitals: tuple[str, ...],
+    questions_left: Optional[int] = None,
+    questions_before_end: int = 0,
+    record: Optional[dict] = None,
+    deduce: Optional[str] = None,
+    record_gaps: tuple[str, ...] = (),
 ) -> list[dict[str, str]]:
     action_help = "\n".join(ACTION_HELP[a].format(vitals=", ".join(vitals)) for a in actions)
     choices = ", ".join(f'"{a}"' for a in actions)
-    user = "\n\n".join(
-        [
-            _section("DIALOGUE SO FAR", transcript(history) or "[No prior dialogue]"),
-            _section("KNOWN VITAL SIGNS", _vitals_known(history)),
-            _section(
-                "ALLOWED ACTIONS",
-                f"You must choose EXACTLY ONE action this turn, one of [{choices}].\n{action_help}",
-            ),
-        ]
-    )
-    if not any(h["actor"] == "nurse" for h in history):
-        user += (
-            "\n\nAlways state your name in the beginning of the interaction: use a realistic first name, "
-            "never a placeholder such as [Name]."
-        )
+    sections = [
+        _section("DIALOGUE SO FAR", transcript(history) or "[No prior dialogue]"),
+        _section("YOUR TRIAGE RECORD (what you have established so far; work through the triage algorithm "
+                 "and use your questions to fill in as much of it as you can)", _record(record, history)),
+    ]
+    if deduce:
+        sections.append(_section(
+            "INFER A VITAL SIGN",
+            f"The {deduce} could not be measured. Your next action must be a question that lets you infer it "
+            f"from the patient, e.g. about {VITAL_SYMPTOMS[deduce]}. "
+            + (f"It counts as one of your {questions_left} remaining questions." if questions_left > 0
+               else "Ask it even though you have no other questions left."),
+        ))
+    elif questions_left == 0:
+        sections.append(_section(
+            "QUESTIONS LEFT",
+            "You have no questions left. Check any vital signs you still need, then end triage with your final level.",
+        ))
+    elif questions_left is not None:
+        sections.append(_section(
+            "QUESTIONS LEFT",
+            f"You can ask {questions_left} more question{'' if questions_left == 1 else 's'}, counting the one "
+            "you may ask now; checking vital signs does not use them up. "
+            + (f"You must ask at least {questions_before_end} more before you can end triage. "
+               if questions_before_end > 0 else "")
+            + (f"You can end triage once every field of your triage record holds an answer (\"none\" or "
+               f"\"declined to say\" are answers); still missing: {', '.join(f.replace('_', ' ') for f in record_gaps)}."
+               if record_gaps else "" if questions_before_end > 0
+               else "You may end triage at any time; you do not have to use them all."),
+        ))
+    sections.append(_section(
+        "ALLOWED ACTIONS", f"You must choose EXACTLY ONE action this turn, one of [{choices}].\n{action_help}"
+    ))
+    user = "\n\n".join(sections)
     return [{"role": "system", "content": _nurse_system(persona, algorithm, patient)}, {"role": "user", "content": user}]
 
 
@@ -455,12 +521,20 @@ you personally experienced or were explicitly told them."""
     rules = """General rules:
 - Answer only what you personally experienced
 - Express uncertainty, confusion, hesitation, or emotion when appropriate
-- Ask for clarification if you do not understand the nurse's question
+- If the nurse uses a word or asks something you would not understand with your health literacy
+  and English, ask what they mean (e.g. "A what? What's that?") instead of answering as if you
+  knew; never use medical terms yourself that you would not know
 - Do NOT jump ahead in the clinical process
 - Do NOT end the conversation on your own
 - Do NOT invent diagnoses, vital signs, lab values, or test results
 - Never mention triage levels or how urgent your case is rated
 - Talk the way patients talk at a triage desk: one or two short sentences, never more than three
+- Never say a personal name, your own or anyone else's
+- Disfluencies, as often as your persona's disfluency level says, are these five: repetitions
+  ("I- I felt it"), filled pauses ("um", "uh"), insertions (adding a word as you restart: "my arm-
+  my left arm"), substitutions (swapping a word: "in my stomach- my chest") and speech errors (a
+  slip you correct: "my blood plessure- pressure"). Write them as spoken, with a dash where you break
+  off; do not use "..." for them
 - Speak as your persona traits below describe"""
     output = """You MUST output a single JSON object with exactly these fields:
 
@@ -492,28 +566,6 @@ Do NOT include any text outside the JSON object."""
     return [{"role": "system", "content": "\n\n".join(sections)}, {"role": "user", "content": user}]
 
 
-# ─────────────────────────────────────────
-# Belief extraction
-# ─────────────────────────────────────────
-
-BELIEF_SYSTEM = """You extract structured clinical evidence from one patient reply in an emergency
-department triage conversation. The nurse's question is context only: extract ONLY what the
-patient's reply states or clearly implies.
-
-Return ONLY a JSON object with these fields:
-- chief_complaint: the patient's chief complaint phrase, or null
-- pain_severity: "mild", "moderate" or "severe", or null if pain is not described
-- pain_location: anatomical location of the pain, or null
-- duration: how long the problem has lasted (e.g. "two days", "since this morning"), or null
-- symptoms: list of associated symptoms mentioned (empty list if none)
-- red_flags: list of clinical red flags explicitly or implicitly suggested (empty list if none)"""
-
-
-def belief_messages(nurse_utterance: str, patient_utterance: str) -> list[dict[str, str]]:
-    user = f'Nurse: """{nurse_utterance}"""\nPatient: """{patient_utterance}"""'
-    return [{"role": "system", "content": BELIEF_SYSTEM}, {"role": "user", "content": user}]
-
-
 
 # ─────────────────────────────────────────
 # Dialogue master
@@ -529,14 +581,27 @@ JUDGE_CRITERIA = {
   contradicting the facts or inventing new ones does not.
 - informative: it responds to the nurse's last message (answers it, or plausibly asks for clarification).
 - in_persona: it matches the persona traits listed and the mental state and intoxication in the
-  ground truth, and it is as short as spoken triage talk (at most three short sentences).""",
+  ground truth, and it is as short as spoken triage talk (at most three short sentences).
+- plausible: a real patient in this situation could plausibly say it at a triage desk: realistic
+  content and everyday wording, with no medically odd claims (e.g. that a treatable problem is beyond
+  help), textbook phrasing or theatrical lines.
+- no_names: it says no personal name, neither the patient's own nor anyone else's.""",
     "nurse": """- faithful: every fact it states was obtained in the dialogue or from vital signs, it keeps
   the triage level to itself, it suits triage under {algorithm}, and it fits the patient's apparent
   gender.
 - informative: it moves triage forward: it asks for information not obtained yet, or gives
   reassurance or an explanation the patient needs.
 - in_persona: it matches the nurse persona traits listed (interview style only), and it is one short
-  question or statement, as said aloud at a triage desk.""",
+  question or statement, as said aloud at a triage desk.
+- plausible: a real triage nurse could plausibly say it at the desk: realistic, professional and
+  natural wording.
+- no_names: it uses no personal names: the nurse does not introduce itself by name and does not
+  ask for or use the patient's name.
+- one_question: it asks for one thing only: not two questions joined by "and" or asked one after
+  the other (e.g. not "When did it start, and is it bleeding?" or "How long have you felt dizzy?
+  Did it start suddenly?"). One yes/no question listing related symptoms ("Any nausea, vomiting or
+  fever?") or offering alternatives ("Did it start suddenly or gradually?") is one question; a
+  statement without a question passes.""",
 }
 
 JUDGE_SYSTEM = """You are the dialogue master of a simulated emergency department triage
@@ -581,15 +646,52 @@ def judge_messages(
     ]
 
 
-READING_SYSTEM = """You read ONE utterance from an emergency department triage conversation, with no
-other context. In one sentence, state the information it conveys, based only on its words."""
+EDIT_SYSTEM = """You are the dialogue master of a simulated emergency department triage
+conversation. A new {speaker} utterance failed your checks, even after the {speaker} rewrote it:
+
+{criteria}
+
+Your critique: {critique}
+
+Write the utterance yourself so that it passes every check: keep what the {speaker} meant to say and
+how this persona speaks, and change as little as possible.{extra}"""
 
 
-def reading_messages(speaker: str, utterance: str) -> list[dict[str, str]]:
-    """The dialogue master's context-free reading of an utterance."""
+def edit_messages(speaker: str, utterance: str, critique: str, persona: BaseModel, history: list[dict], **context):
+    """Messages asking the dialogue master to write a line that failed its checks twice; `context`
+    is what judge_messages takes (case, script, algorithm, patient)."""
+    messages = judge_messages(speaker, utterance, persona, history, **context)
+    criteria = JUDGE_CRITERIA[speaker].format(algorithm=context.get("algorithm", "esi").upper())
+    extra = " Also give, in one sentence, the information your version reveals." if speaker == "patient" else ""
+    system = EDIT_SYSTEM.format(speaker=speaker, criteria=criteria, critique=critique, extra=extra)
+    return [{"role": "system", "content": system}, messages[1]]
+
+
+READING_SYSTEM = """You are the dialogue master of a simulated emergency department triage. You keep the
+nurse's triage record: what the conversation has established so far. Read the latest exchange (the
+nurse's question and the patient's reply) and answer from its words alone, not from anything else
+you may know about the patient.
+- conveyed: one sentence stating the information the patient's reply conveys.
+- record: the full triage record after this exchange. For every field write its complete current
+  value, briefly: what was already recorded plus anything new this reply adds; copy fields the reply
+  does not touch as they are, and write exactly "{unknown}" for a field that is still unknown.
+  Record only what was said: a vague answer is recorded as vague (e.g. "pain 'really bad', no score
+  given"); if the patient cannot or will not answer what was asked, record that (e.g. "declined to
+  say", "does not know"). A reply that does not answer the question (it changes the subject, asks
+  for clarification or only voices worry) adds nothing about it: never record a denial or finding
+  the patient did not state, never infer a diagnosis, never add facts.
+Record fields:
+{fields}"""
+
+
+def reading_messages(record: dict, question: str, reply: str) -> list[dict[str, str]]:
+    """The dialogue master's reading of one exchange, given the triage record so far."""
+    fields = "\n".join(f"- {name}: {desc}" for name, desc in RECORD_FIELDS.items())
+    current = "\n".join(f"- {name}: {record.get(name) or RECORD_UNKNOWN}" for name in RECORD_FIELDS)
+    exchange = f'Nurse: """{question}"""\nPatient: """{reply}"""'
     return [
-        {"role": "system", "content": READING_SYSTEM},
-        {"role": "user", "content": f'{speaker.title()}: """{utterance}"""'},
+        {"role": "system", "content": READING_SYSTEM.format(fields=fields, unknown=RECORD_UNKNOWN)},
+        {"role": "user", "content": _section("TRIAGE RECORD SO FAR", current) + "\n\n" + _section("LATEST EXCHANGE", exchange)},
     ]
 
 

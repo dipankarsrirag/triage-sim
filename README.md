@@ -11,7 +11,7 @@
 - **Schema-constrained outputs**: agents answer in JSON that is enforced during decoding, including which actions and vitals the nurse may pick at each step
 - **Two triage algorithms**: ESI (Emergency Severity Index) and ATS (Australasian Triage Scale)
 - **Research-grounded personas**: combinatorial patient and nurse personas built from ED-research traits with behavioural anchors (health literacy, symptom reporting, disclosure, questioning style, ...)
-- **Structured run artifacts**: dialogue, vitals checked, red flags logged, per-step triage reasoning and per-turn belief extraction
+- **Structured run artifacts**: dialogue, vitals checked, red flags logged, per-step triage reasoning and the nurse's triage record (its beliefs, kept by the dialogue master)
 - **Reproducible and resumable** runs to JSONL, straight from MIMIC-IV-ED `triage.csv` or your own vignettes
 - **Optional audio rendering**: XTTS-v2 voice cloning for multi-speaker TTS synthesis
 
@@ -59,7 +59,7 @@ triagesim --model openrouter:anthropic/claude-sonnet-4.5 --algorithm ats --episo
     --out outputs/claude.jsonl
 ```
 
-Each role can use its own model (`--nurse-model`, `--patient-model`, `--belief-model`, `--judge-model`),
+Each role can use its own model (`--nurse-model`, `--patient-model`, `--judge-model`),
 each either vLLM or OpenRouter, e.g. a hosted nurse against a local patient simulator. Different vLLM
 models share one GPU and split its memory evenly unless `--vllm-args` sets `gpu_memory_utilization`.
 
@@ -67,7 +67,8 @@ models share one GPU and split its memory evenly unless `--vllm-args` sets `gpu_
 checks every spoken line (`--max-regenerations`, default 1).
 
 Episodes are appended to `--out` as they finish; re-running the same command skips episodes already
-there, so an interrupted run just resumes. Episodes whose LLM calls keep failing go to
+there, so an interrupted run just resumes. Ctrl-C or SIGTERM stops a run at once: finished episodes
+are kept, and the ones in flight run again on the next run. Episodes whose LLM calls keep failing go to
 `<out>.errors.jsonl` and are retried on the next run. At the end the command prints summary metrics.
 `triagesim --help` lists the other options (`--max-turns`, `--sampling`, `--concurrency`, `--seed`, ...);
 arguments can also come from a file, one per line: `triagesim @run.args`.
@@ -99,7 +100,7 @@ print(summarize(episodes))
 
 `simulate` yields one dict per episode as it finishes, so large runs can be streamed to disk.
 Keyword arguments to `VLLM` go to `vllm.LLM` (plus `chat_template_kwargs`, e.g.
-`{"enable_thinking": False}`); sampling parameters per role (`nurse`, `patient`, `belief`, `judge`)
+`{"enable_thinking": False}`); sampling parameters per role (`nurse`, `patient`, `judge`, `script`)
 override the model's `generation_config` defaults.
 
 ---
@@ -199,22 +200,40 @@ python scripts/generate_personas.py --out-dir data/personas
 
 ## How an Episode Runs
 
-Each turn the nurse acts until it speaks: it may first check **one** vital sign (`check_vital`, the
-value comes from the case) and log red flags once (`log_red_flag`), then either asks the patient
-something (`utterance`) or ends triage (`end`). Every nurse step also gives its rationale, then its
-current triage estimate and confidence. The patient then replies once, and the nurse's model extracts
-what the reply revealed (chief complaint, pain, duration, symptoms, red flags). The episode ends when
-the nurse ends it (its triage level then is the final one) or after `max_turns` patient replies.
+Each turn the nurse acts until it speaks: it may first check one vital sign it does not know yet
+(`check_vital`, the value comes from the case; what it says while taking one, e.g. "Let me check
+your blood pressure.", enters the dialogue if longer than two words), so vitals are spread through
+the conversation without using up questions, and log red flags once
+(`log_red_flag`), then either asks the patient something (`utterance`) or ends triage (`end`). Every
+nurse step also gives its rationale, then its current triage estimate and confidence, and is told how
+many questions it has left (`max_turns`, default 12); only questions use them up. The patient then
+replies once.
+The nurse may end only after `min_questions` questions (default 3) and, with a dialogue master,
+once every field of its triage record holds an answer ("none" and "declined to say" count) or its
+questions run out; the prompt lists what a triage interview usually covers. After its last question is answered it gets one more
+step without questions: it may check any vitals it still needs and log red flags, then ends with its final level
+(`end_reason` is then `"max_turns"`). When it ends it says a brief closing line to the patient
+(never the triage level).
 
 With a dialogue master, every nurse and patient line is checked before it enters the dialogue for
 faithfulness (to the case and script, or to what the nurse has actually learned), information gain,
-and persona adherence. A rejected line is regenerated with the critique; if it still fails it is kept
-and flagged, with the rejected drafts, for post-hoc filtering.
+persona adherence, real-world plausibility and the absence of names; a nurse line must also ask for
+one thing only (no two questions joined by "and"; a list of related symptoms or an either/or choice
+counts as one question). A rejected line goes back to
+the speaker with the master's reason; if the new line still fails, the master writes the line itself
+(`verification.edited`), keeping the speaker's intent and persona. The rejected drafts are kept.
+
+The nurse's beliefs are its **triage record**: chief complaint, onset and course, pain, associated
+symptoms, relevant history, medications, allergies, and the vital signs taken. With a dialogue master,
+after every patient reply the master reads the exchange (the nurse's question and the reply, words
+alone) and writes what it conveyed into the record; vital signs are added as they are taken. The
+nurse sees the record, with its gaps, at every step, and the final record is saved with the episode.
 
 Every patient line also records what information passed, from three sides, under `information`:
 `disclosed` (the patient's own one-sentence account of what it revealed), `understood` (the nurse's
 one-sentence reading of it, written in its next step before it acts) and, with a dialogue master,
-`conveyed` (the master's reading of the utterance's words alone, without the case or the dialogue).
+`conveyed` (the master's one-sentence reading of the exchange's words alone, without the case) and
+`recorded` (what it added to the triage record).
 
 ---
 
@@ -232,10 +251,11 @@ Each episode is a dict (one JSONL line):
 | `patient_script` | The script drawn for this episode, if any |
 | `end_reason` | `"nurse_end"` or `"max_turns"` |
 | `final_triage`, `num_turns` | The nurse's triage level at its last step; number of patient replies |
+| `transcript` | The output transcript: spoken nurse and patient lines only (`speaker`, `text`); lines kept for the agents alone, such as announcing a vital that could not be measured, are left out |
 | `history` | Dialogue and events: utterances (patient lines with `information`, and `verification` when a judge is used), vitals, triage end |
 | `trace` | Every nurse step: action, vital, utterance, triage, confidence, red flags, explanation |
 | `red_flags` | Red flags logged by the nurse (deduplicated) |
-| `beliefs` | Per patient turn, the information extracted from the reply |
+| `record` | The nurse's final triage record: the fields the dialogue master filled in, and `vitals` taken |
 
 ---
 

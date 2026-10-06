@@ -1,15 +1,13 @@
 from triagesim import prompts
 
 
-def test_nurse_is_asked_for_its_name_until_it_first_speaks(nurse_persona):
-    vital = {"turn": 0, "actor": "system", "event": "vital", "name": "sbp", "value": 98.0}
-    said = {"turn": 0, "actor": "nurse", "utterance": "Hi, I'm Sam.", "triage": 3}
-
-    def user(history):
-        return prompts.nurse_messages(nurse_persona, "esi", "- gender: male", history, ("utterance", "end"), ())[1]["content"]
-
-    assert "state your name" in user([vital]) and "never a placeholder" in user([vital])
-    assert "state your name" not in user([vital, said])
+def test_no_one_uses_names_and_the_judge_checks_it(nurse_persona, patient_persona, case):
+    nurse = prompts.nurse_messages(nurse_persona, "esi", "- gender: male", [], ("utterance", "end"), ())
+    assert "Never use names" in nurse[0]["content"] and "name" not in nurse[1]["content"]
+    assert "Never say a personal name" in prompts.patient_messages(patient_persona, case, None, [])[0]["content"]
+    for speaker, persona in (("nurse", nurse_persona), ("patient", patient_persona)):
+        judge = prompts.judge_messages(speaker, "Hi.", persona, [], case=case)
+        assert "- no_names:" in judge[0]["content"]
 
 
 def test_prompt_prefix_is_static_and_state_is_in_user_message(nurse_persona):
@@ -21,7 +19,8 @@ def test_prompt_prefix_is_static_and_state_is_in_user_message(nurse_persona):
     )
     assert early[0] == later[0]  # system prompt shared by every step of an episode
     assert "Australasian Triage Scale" in early[0]["content"]
-    assert "[Vital] sbp = 98 mmHg" in later[1]["content"] and "- sbp (obtained)" in later[1]["content"]
+    assert "[Vital] sbp = 98 mmHg" in later[1]["content"]
+    assert "- vital signs: sbp 98 mmHg (not yet taken: temperature, heartrate, resprate, o2sat)" in later[1]["content"]
     assert '"check_vital"' in early[1]["content"] and '"check_vital"' not in later[1]["content"]
 
 
@@ -97,3 +96,10 @@ def test_prior_ed_visits_reach_patient_and_master(case, patient_persona):
     assert "this emergency department in the past year, before today: 5" in prompts.patient_messages(patient_persona, frequent, None, [])[0]["content"]
     assert "ED visits in the past year, before this one: 5" in prompts.script_messages(frequent, patient_persona)[1]["content"]
     assert "past year" not in prompts.patient_messages(patient_persona, case, None, [])[0]["content"]  # unknown: not shown
+
+
+def test_patients_ask_instead_of_bluffing_and_the_master_ignores_non_answers(patient_persona, case):
+    system = prompts.patient_messages(patient_persona, case, None, [])[0]["content"]
+    assert "ask what they mean" in system and "never use medical terms yourself" in system
+    reading = prompts.reading_messages({}, "Any palpitations?", "I'm just scared.")[0]["content"]
+    assert "adds nothing about it: never record a denial" in " ".join(reading.split())

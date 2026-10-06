@@ -4,9 +4,12 @@ LLM backends: vLLM (in-process) and OpenRouter.
 A backend takes a batch of chat requests and returns one raw completion per request, constrained
 to the request's pydantic schema (vLLM: structured outputs; OpenRouter: `json_schema` response
 format). `generate` parses and validates the completions and retries the ones that fail.
+`batched` says how `simulate` should drive a backend: in rounds of one large batch (in-process
+vLLM), or one request at a time per episode, so no episode waits for another (HTTP backends).
 """
 
 import os
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -47,6 +50,8 @@ class VLLM:
         chat_template_kwargs: passed to the chat template, e.g. {"enable_thinking": False}.
         **engine_args: passed to `vllm.LLM`, e.g. max_model_len=8192, gpu_memory_utilization=0.9.
     """
+
+    batched = True
 
     def __init__(self, model: str, *, chat_template_kwargs: Optional[dict] = None, **engine_args):
         from vllm import LLM
@@ -103,11 +108,14 @@ _OPENAI_PARAMS = {"temperature", "top_p", "max_tokens", "presence_penalty", "fre
 
 
 class OpenRouter:
-    """OpenRouter chat completions, `max_workers` requests in flight at a time.
+    """OpenRouter (or any OpenAI-compatible server, e.g. `vllm serve`) chat completions, at most
+    `max_workers` requests in flight at a time across all calls to `complete`.
 
     The API key comes from `api_key` or OPENROUTER_API_KEY (environment or a .env file). The
     default `extra_body` asks reasoning models for low reasoning effort.
     """
+
+    batched = False
 
     def __init__(
         self,
@@ -131,6 +139,8 @@ class OpenRouter:
         self.max_workers = max_workers
         self.extra_body = {"reasoning": {"effort": "low"}} if extra_body is None else extra_body
         self.usage: Counter = Counter()
+        self._slots = threading.Semaphore(max_workers)  # `complete` may be called from many threads
+        self._usage_lock = threading.Lock()
 
     def _complete_one(self, r: Request) -> tuple[str | Exception, Counter]:
         kwargs = {k: v for k, v in r.sampling.items() if k in _OPENAI_PARAMS}
@@ -139,16 +149,17 @@ class OpenRouter:
             kwargs["seed"] = r.seed
         usage = Counter()
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=r.messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": r.output_type.__name__, "strict": True, "schema": _schema(r.output_type)},
-                },
-                extra_body={**self.extra_body, **extra},
-                **kwargs,
-            )
+            with self._slots:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=r.messages,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": r.output_type.__name__, "strict": True, "schema": _schema(r.output_type)},
+                    },
+                    extra_body={**self.extra_body, **extra},
+                    **kwargs,
+                )
             usage.update(calls=1)
             if resp.usage:
                 usage.update(prompt_tokens=resp.usage.prompt_tokens, completion_tokens=resp.usage.completion_tokens)
@@ -162,8 +173,9 @@ class OpenRouter:
     def complete(self, requests: list[Request]) -> list[str | Exception]:
         with ThreadPoolExecutor(self.max_workers) as pool:
             done = list(pool.map(self._complete_one, requests))
-        for _, usage in done:
-            self.usage.update(usage)
+        with self._usage_lock:
+            for _, usage in done:
+                self.usage.update(usage)
         return [text for text, _ in done]
 
 

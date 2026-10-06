@@ -1,14 +1,17 @@
 """
-Episode loop and batched driver.
+Episode loop and driver.
 
 An episode is a generator: it yields (role, messages, output_type) for each LLM call and gets the
-validated output back. `simulate` keeps up to `concurrency` episodes in flight and sends all their
-pending calls to the backends as one batch per round, so vLLM always works on large batches.
+validated output back. `simulate` keeps up to `concurrency` episodes in flight. With HTTP backends
+(OpenRouter, `vllm serve`) each episode sends its next call as soon as its last one returns, so no
+episode waits for another and the server batches whatever is in flight. With an in-process vLLM
+engine the episodes move in rounds: all their pending calls go to the engine as one batch.
 """
 
 import random
+import re
 import zlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Sequence
 
@@ -17,12 +20,16 @@ from triagesim.cases import Case
 from triagesim.llm import Backend, GenerationError, Request, generate
 from triagesim.personas import NursePersona, PatientPersona
 from triagesim.schemas import (
+    RECORD_FIELDS,
+    RECORD_UNKNOWN,
     VITALS,
-    BeliefExtraction,
     InSitu,
+    LineEdit,
+    PatientLineEdit,
     PatientOutput,
     PatientScript,
     Reading,
+    NurseVerdict,
     Verdict,
     nurse_output_type,
 )
@@ -30,11 +37,16 @@ from triagesim.schemas import (
 DEFAULT_SAMPLING = {
     "nurse": {"max_tokens": 1024},
     "patient": {"max_tokens": 512},
-    "belief": {"max_tokens": 512, "temperature": 0.0},
     "judge": {"max_tokens": 512, "temperature": 0.0},
     "script": {"max_tokens": 2048},
 }
 MAX_FLAGS_PER_LOG = 5
+TRIAGE_LEVEL = re.compile(r"\b(ESI|ATS|triage (level|category)|level [1-5]|category [1-5])\b", re.I)
+# values that carry no information: they never replace what the record already holds
+PLACEHOLDER = re.compile(
+    rf"\s*({re.escape(RECORD_UNKNOWN)}|unchanged|no change|same|not (yet )?(established|mentioned|asked)|null|n/?a)?\s*\.?\s*$",
+    re.I,
+)
 
 Call = tuple[str, list[dict[str, str]], type]
 EpisodeGen = Generator[Call, Any, dict]
@@ -57,12 +69,14 @@ def _reviewed(
     judge_messages: Optional[Callable[[str], list[dict[str, str]]]],
     max_regenerations: int,
     regenerate_as: type,
+    edit: Optional[tuple[Callable[[str, str], list[dict[str, str]]], type]] = None,
 ):
     """Yield a speaker call; if a judge is set, check the utterance and regenerate with its critique.
 
     Returns (output, verification). Verification is None when nothing was checked (no judge, or the
-    nurse chose an action other than speaking); an utterance that still fails after
-    `max_regenerations` is kept and flagged with passed=False, with the rejected drafts.
+    nurse chose an action other than speaking). An utterance that still fails after
+    `max_regenerations` is written by the judge itself if `edit` (messages builder, output type) is
+    given (edited=True), else kept and flagged with passed=False; the rejected drafts are kept.
     """
     rejected: list[dict] = []
     current = messages
@@ -71,42 +85,83 @@ def _reviewed(
         if judge_messages is None or getattr(out, "action", "utterance") != "utterance":
             return out, None
         try:
-            verdict: Verdict = yield "judge", judge_messages(out.utterance), Verdict
+            verdict_type = NurseVerdict if speaker == "nurse" else Verdict
+            verdict: Verdict = yield "judge", judge_messages(out.utterance), verdict_type
         except GenerationError as e:  # an unavailable judge must not end the dialogue
             return out, {"passed": None, "error": str(e), "rejected": rejected}
         if verdict.passed:
             return out, {"passed": True, "verdict": verdict.model_dump(), "rejected": rejected}
         if len(rejected) == max_regenerations:
+            if edit is not None:
+                edit_messages, edit_type = edit
+                try:
+                    fixed = yield "judge", edit_messages(out.utterance, verdict.critique), edit_type
+                    rejected.append({"utterance": out.utterance, "verdict": verdict.model_dump()})
+                    out = out.model_copy(update=fixed.model_dump())
+                    return out, {"passed": True, "edited": True, "verdict": verdict.model_dump(), "rejected": rejected}
+                except GenerationError:  # keep the speaker's line, flagged
+                    pass
             return out, {"passed": False, "verdict": verdict.model_dump(), "rejected": rejected}
         rejected.append({"utterance": out.utterance, "verdict": verdict.model_dump()})
         current = prompts.with_feedback(messages, out.model_dump_json(), verdict.critique)
         output_type = regenerate_as  # a regenerated nurse line must still be an utterance
 
 
-def _nurse_phase(ep: _Episode, history: list, trace: list, red_flags: list, turn: int, review: bool, max_regen: int):
+def _nurse_phase(
+    ep: _Episode,
+    history: list,
+    trace: list,
+    red_flags: list,
+    turn: int,
+    questions_left: int,
+    questions_before_end: int,
+    record: dict,
+    review: bool,
+    max_regen: int,
+):
     """Nurse micro-steps until it speaks or ends triage; returns True if it ended.
 
-    Within a phase the nurse may check one vital and log red flags once before speaking. Its first
-    step after a patient reply records what it understood from that reply on the reply's entry.
+    Within a phase the nurse may check one vital not yet known and log red flags once before
+    speaking, so vital signs are spread through the conversation; only speaking uses up a question.
+    With no questions left it may check every vital it still needs and log red flags, then must end;
+    it may end only after `questions_before_end` more questions and, with a dialogue master
+    (`review`), once every field of its triage record holds an answer. A vital the case lacks cannot be
+    measured: checking it says so, and the nurse's next step must be a question that lets it infer
+    that vital from the patient (even with no questions left). Its first step after a patient reply
+    records what it understood from that reply on the reply's entry. Each step shows the nurse its
+    triage record and how many questions it has left. What it says while taking a vital sign goes
+    into the dialogue if it is longer than two words.
     """
     vital_checked = flag_logged = False
+    deduce = None  # a vital that could not be measured: the nurse's next step must ask about it
     unread = history[-1] if history and history[-1]["actor"] == "patient" else None
     while True:
         reading = unread is not None
         known = {h["name"] for h in history if h.get("event") == "vital"}
-        vitals = () if vital_checked else tuple(v for v in VITALS if v not in known)
-        actions = (
-            ("utterance",)
-            + (("check_vital",) if vitals else ())
-            + (() if flag_logged else ("log_red_flag",))
-            + ("end",)
+        # with a dialogue master, the nurse may end before its questions run out only with a full record
+        gaps = tuple(k for k in RECORD_FIELDS if record[k] == RECORD_UNKNOWN) if review and questions_left > 0 else ()
+        if deduce:
+            actions, vitals = ("utterance",), ()
+        else:
+            vitals = () if vital_checked and questions_left > 0 else tuple(v for v in VITALS if v not in known)
+            actions = (
+                (("utterance",) if questions_left > 0 else ())
+                + (("check_vital",) if vitals else ())
+                + (() if flag_logged else ("log_red_flag",))
+                + (("end",) if questions_before_end <= 0 and not gaps else ())
+            )
+        messages = prompts.nurse_messages(
+            ep.nurse_persona, ep.algorithm, ep.patient_view, history, actions, vitals, questions_left,
+            questions_before_end, record, deduce, gaps,
         )
-        messages = prompts.nurse_messages(ep.nurse_persona, ep.algorithm, ep.patient_view, history, actions, vitals)
+
+        context = {"algorithm": ep.algorithm, "patient": ep.patient_view}
 
         def judge(utterance: str) -> list[dict[str, str]]:
-            return prompts.judge_messages(
-                "nurse", utterance, ep.nurse_persona, history, algorithm=ep.algorithm, patient=ep.patient_view
-            )
+            return prompts.judge_messages("nurse", utterance, ep.nurse_persona, history, **context)
+
+        def editor(utterance: str, critique: str) -> list[dict[str, str]]:
+            return prompts.edit_messages("nurse", utterance, critique, ep.nurse_persona, history, **context)
 
         out, verification = yield from _reviewed(
             "nurse",
@@ -115,6 +170,7 @@ def _nurse_phase(ep: _Episode, history: list, trace: list, red_flags: list, turn
             judge if review else None,
             max_regen,
             nurse_output_type(("utterance",), (), reading),
+            (editor, LineEdit),
         )
         trace.append({"turn": turn, **out.model_dump()})
         if reading:
@@ -123,9 +179,18 @@ def _nurse_phase(ep: _Episode, history: list, trace: list, red_flags: list, turn
 
         if out.action == "check_vital":
             value = ep.case.vitals.get(out.vital)
-            history.append({"turn": turn, "actor": "system", "event": "vital", "name": out.vital, "value": value})
+            if out.utterance and len(out.utterance.split()) > 2:
+                line = {"turn": turn, "actor": "nurse", "utterance": out.utterance, "action": "check_vital"}
+                if value is None:  # the agents see the attempt; the output transcript leaves it out
+                    line["in_transcript"] = False
+                history.append(line)
+            event = {"turn": turn, "actor": "system", "event": "vital", "name": out.vital, "value": value}
+            if value is None:  # not in the case: cannot be measured, so the nurse asks about it next
+                event["measurable"] = False
+                deduce = out.vital
+            history.append(event)
             vital_checked = True
-        elif out.action == "log_red_flag":
+        elif out.action == "log_red_flag":  # an empty list logs nothing; the step is used up
             seen = {" ".join(f.lower().split()) for f in red_flags}
             new = []
             for flag in out.red_flags:
@@ -136,22 +201,29 @@ def _nurse_phase(ep: _Episode, history: list, trace: list, red_flags: list, turn
             red_flags.extend(new)
             flag_logged = True
         elif out.action == "end":
+            if out.utterance and len(out.utterance.split()) > 2:  # the nurse's closing words to the patient
+                line = {"turn": turn, "actor": "nurse", "utterance": out.utterance, "action": "end"}
+                if TRIAGE_LEVEL.search(out.utterance):  # must not tell the patient its level: kept out of the output
+                    line["in_transcript"] = False
+                history.append(line)
             history.append({"turn": turn, "actor": "system", "event": "triage_end", "triage": out.triage})
             return True
         else:
             entry = {"turn": turn, "actor": "nurse", "utterance": out.utterance, "triage": out.triage}
+            if deduce:
+                entry["infers"] = deduce
             if verification is not None:
                 entry["verification"] = verification
             history.append(entry)
             return False
 
 
-def _run_episode(ep: _Episode, max_turns: int, extract_beliefs: bool, review: bool, max_regen: int) -> EpisodeGen:
+def _run_episode(ep: _Episode, max_turns: int, min_questions: int, review: bool, max_regen: int) -> EpisodeGen:
     history: list[dict] = []
     trace: list[dict] = []
     red_flags: list[str] = []
-    beliefs: list[dict] = []
-    ended, error = False, None
+    record = dict.fromkeys(RECORD_FIELDS, RECORD_UNKNOWN)  # the nurse's beliefs, kept by the master
+    turn, error = 0, None
     setup: dict[str, Any] = {}  # the dialogue master's in-situ check and script, or why they are missing
     script: Optional[PatientScript] = None
 
@@ -184,16 +256,23 @@ def _run_episode(ep: _Episode, max_turns: int, extract_beliefs: bool, review: bo
     setup["patient_script"] = None if script is None else script.model_dump()
 
     try:
-        for turn in range(max_turns):
-            ended = yield from _nurse_phase(ep, history, trace, red_flags, turn, review, max_regen)
+        while True:  # after the last question the nurse may still check vitals (and infer missing ones), then ends
+            ended = yield from _nurse_phase(
+                ep, history, trace, red_flags, turn, max(max_turns - turn, 0), min(min_questions, max_turns) - turn,
+                record, review, max_regen,
+            )
             if ended:
                 break
 
-            def judge(utterance: str) -> list[dict[str, str]]:
-                return prompts.judge_messages(
-                    "patient", utterance, ep.patient_persona, history, case=ep.case, script=script
-                )
+            context = {"case": ep.case, "script": script}
 
+            def judge(utterance: str) -> list[dict[str, str]]:
+                return prompts.judge_messages("patient", utterance, ep.patient_persona, history, **context)
+
+            def editor(utterance: str, critique: str) -> list[dict[str, str]]:
+                return prompts.edit_messages("patient", utterance, critique, ep.patient_persona, history, **context)
+
+            question = history[-1]["utterance"]
             reply, verification = yield from _reviewed(
                 "patient",
                 prompts.patient_messages(ep.patient_persona, ep.case, script, history),
@@ -201,40 +280,40 @@ def _run_episode(ep: _Episode, max_turns: int, extract_beliefs: bool, review: bo
                 judge if review else None,
                 max_regen,
                 PatientOutput,
+                (editor, PatientLineEdit),
             )
-            # what passed: the patient's own account, the master's reading of the words alone, and
-            # (filled in at the nurse's next step) what the nurse understood
-            info = {"disclosed": reply.disclosed, "conveyed": None, "understood": None}
+            # what passed: the patient's own account, the master's reading of the exchange's words alone
+            # (and what it added to the record), and (at the nurse's next step) what the nurse understood
+            info = {"disclosed": reply.disclosed, "conveyed": None, "recorded": None, "understood": None}
             entry = {"turn": turn, "actor": "patient", "utterance": reply.utterance, "information": info}
             if verification is not None:
                 entry["verification"] = verification
             history.append(entry)
             if review:
-                try:
-                    reading = yield "judge", prompts.reading_messages("patient", reply.utterance), Reading
+                try:  # a failed reading must not end the dialogue; the record just misses this exchange
+                    reading = yield "judge", prompts.reading_messages(record, question, reply.utterance), Reading
                     info["conveyed"] = reading.conveyed
+                    # the master rewrites the full record; a field changes only to real information
+                    new = {k: v.strip() for k, v in reading.record.model_dump().items()}
+                    info["recorded"] = {k: v for k, v in new.items() if not PLACEHOLDER.match(v) and v != record[k]}
+                    record.update(info["recorded"])
                 except GenerationError as e:
                     info["conveyed_error"] = str(e)
-            if extract_beliefs:
-                nurse_said = history[-2]["utterance"]
-                try:  # beliefs are auxiliary: a failed extraction must not end the dialogue
-                    belief = yield "belief", prompts.belief_messages(nurse_said, reply.utterance), BeliefExtraction
-                    beliefs.append({"turn": turn, **belief.model_dump()})
-                except GenerationError as e:
-                    beliefs.append({"turn": turn, "error": str(e)})
+            turn += 1
     except GenerationError as e:
         error = str(e)
 
     return artifact(
         "error" if error else "ok",
         error=error,
-        end_reason="error" if error else "nurse_end" if ended else "max_turns",
+        end_reason="error" if error else "max_turns" if turn >= max_turns else "nurse_end",
         final_triage=trace[-1]["triage"] if trace else None,
         num_turns=sum(h["actor"] == "patient" for h in history),
+        transcript=prompts.spoken_transcript(history),
         history=history,
         trace=trace,
         red_flags=red_flags,
-        beliefs=beliefs,
+        record={**record, "vitals": {h["name"]: h["value"] for h in history if h.get("event") == "vital"}},
     )
 
 
@@ -257,11 +336,10 @@ def simulate(
     nurse_personas: Sequence[NursePersona],
     patient_personas: Sequence[PatientPersona],
     algorithm: Optional[str] = None,
-    belief_llm: Optional[Backend] = None,
-    extract_beliefs: bool = True,
     judge_llm: Optional[Backend] = None,
     max_regenerations: int = 1,
     max_turns: int = 12,
+    min_questions: int = 3,
     episodes_per_case: int = 1,
     seed: Optional[int] = 0,
     concurrency: int = 256,
@@ -270,18 +348,20 @@ def simulate(
 ) -> Iterator[dict]:
     """Simulate triage episodes, yielding one artifact dict per episode as it finishes.
 
+    The nurse asks at most `max_turns` questions and may end triage only after `min_questions`.
     Episode ids are "<case_id>-<k>" for k < episodes_per_case. Personas (the patient taking the
     case's gender) are drawn per episode from `seed` and the episode id, so a run is reproducible and
     ids in `skip` (e.g. already done) can be left out without changing the rest.
 
     `algorithm` ("esi"/"ats") applies to every case; by default each case uses its `acuity_scale`,
-    else ESI. The belief extractor defaults to the nurse's backend. With a `judge_llm` (the dialogue
-    master), each episode starts with the master checking that the case would have a triage
-    conversation in situ (status "skipped" with its reasoning if not) and writing the patient's
-    script from the case and the patient persona; every spoken line is then checked and regenerated
-    with feedback up to `max_regenerations` times, then flagged. Cases without a ground-truth acuity
-    are skipped. `sampling` overrides DEFAULT_SAMPLING per role ("nurse", "patient", "belief",
-    "judge", "script"). Episodes whose LLM calls keep failing are yielded with status "error" and the
+    else ESI. With a `judge_llm` (the dialogue master), each episode starts with the master checking
+    that the case would have a triage conversation in situ (status "skipped" with its reasoning if
+    not) and writing the patient's script from the case and the patient persona; every spoken line is
+    then checked and regenerated with feedback up to `max_regenerations` times, then flagged, and
+    after every patient reply the master updates the nurse's triage record from the exchange (the
+    nurse sees the record at every step; vital signs are added as they are taken). Cases without a
+    ground-truth acuity are skipped. `sampling` overrides DEFAULT_SAMPLING per role ("nurse",
+    "patient", "judge", "script"). Episodes whose LLM calls keep failing are yielded with status "error" and the
     dialogue up to the failure.
     """
     if algorithm is not None and algorithm not in prompts.ALGORITHMS:
@@ -294,14 +374,11 @@ def simulate(
     llms = {
         "nurse": nurse_llm,
         "patient": patient_llm,
-        "belief": belief_llm or nurse_llm,
         "judge": judge_llm,
         "script": judge_llm,
     }
     role_sampling = {role: {**DEFAULT_SAMPLING[role], **(sampling or {}).get(role, {})} for role in llms}
     models = {"nurse": nurse_llm.model, "patient": patient_llm.model}
-    if extract_beliefs:
-        models["belief"] = llms["belief"].model
     if judge_llm is not None:
         models["judge"] = judge_llm.model
     review = judge_llm is not None
@@ -325,36 +402,79 @@ def simulate(
         active: dict[str, list] = {}  # episode id -> [generator, pending call, calls made]
         finished: list[dict] = []  # episodes that ended before their first LLM call
 
-        def fill():
+        def fill() -> list[str]:
+            """Start episodes up to `concurrency`; returns the ids of those now waiting on a call."""
+            started = []
             while len(active) < concurrency and (ep := next(todo, None)) is not None:
-                gen = _run_episode(ep, max_turns, extract_beliefs, review, max_regenerations)
+                gen = _run_episode(ep, max_turns, min_questions, review, max_regenerations)
                 try:
                     active[ep.episode_id] = [gen, next(gen), 0]
+                    started.append(ep.episode_id)
                 except StopIteration as stop:
                     finished.append(stop.value)
+            return started
 
-        fill()
-        while active or finished:
-            while finished:
-                yield {**finished.pop(0), "models": models}
-            if not active:
-                fill()
-                continue
-            groups: dict[int, tuple[Backend, list]] = {}
-            for eid, (_, (role, messages, output_type), n) in active.items():
-                call_seed = None if seed is None else zlib.crc32(f"{seed}/{eid}/{n}".encode())
-                backend = llms[role]
-                groups.setdefault(id(backend), (backend, []))[1].append(
-                    (eid, Request(messages, output_type, role_sampling[role], call_seed))
-                )
-            for eid, result in _generate_groups(list(groups.values())):
-                state = active[eid]
-                try:
-                    state[1] = state[0].throw(result) if isinstance(result, GenerationError) else state[0].send(result)
-                    state[2] += 1
-                except StopIteration as stop:
-                    del active[eid]
-                    yield {**stop.value, "models": models}
+        def call(eid: str) -> tuple[Backend, Request]:
+            _, (role, messages, output_type), n = active[eid]
+            call_seed = None if seed is None else zlib.crc32(f"{seed}/{eid}/{n}".encode())
+            return llms[role], Request(messages, output_type, role_sampling[role], call_seed)
+
+        def advance(eid: str, result) -> Optional[dict]:
+            """Send a call's result to its episode; returns the artifact if the episode ended."""
+            state = active[eid]
+            try:
+                state[1] = state[0].throw(result) if isinstance(result, GenerationError) else state[0].send(result)
+                state[2] += 1
+            except StopIteration as stop:
+                del active[eid]
+                return {**stop.value, "models": models}
+            return None
+
+        def rounds() -> Iterator[dict]:
             fill()
+            while active or finished:
+                while finished:
+                    yield {**finished.pop(0), "models": models}
+                if not active:
+                    fill()
+                    continue
+                groups: dict[int, tuple[Backend, list]] = {}
+                for eid in active:
+                    backend, request = call(eid)
+                    groups.setdefault(id(backend), (backend, []))[1].append((eid, request))
+                for eid, result in _generate_groups(list(groups.values())):
+                    if (done := advance(eid, result)) is not None:
+                        yield done
+                fill()
+
+        def independent() -> Iterator[dict]:
+            pool = ThreadPoolExecutor(concurrency)
+            pending: dict[Future, str] = {}
+
+            def submit(eids: list[str]) -> None:
+                for eid in eids:
+                    backend, request = call(eid)
+                    pending[pool.submit(lambda b=backend, r=request: generate(b, [r])[0])] = eid
+
+            try:
+                submit(fill())
+                while pending or finished:
+                    while finished:
+                        yield {**finished.pop(0), "models": models}
+                    if not pending:
+                        submit(fill())
+                        continue
+                    for future in wait(pending, return_when=FIRST_COMPLETED).done:
+                        eid = pending.pop(future)
+                        if (done := advance(eid, future.result())) is None:
+                            submit([eid])
+                        else:
+                            yield done
+                    submit(fill())
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+        batched = any(b.batched for b in llms.values() if b is not None)
+        return rounds() if batched else independent()
 
     return drive()

@@ -30,7 +30,7 @@ class NurseOutput(_Output):
     )
     action: Action = Field(description="Next action chosen by the nurse")
     vital: Optional[Vital] = Field(description="Vital sign to check if action is 'check_vital', else null")
-    utterance: Optional[str] = Field(description="What the nurse says; null if action is 'log_red_flag' or 'end'")
+    utterance: Optional[str] = Field(description="What the nurse says (with 'end', a closing line); null if action is 'log_red_flag'")
     red_flags: list[str] = Field(description="All red flags identified so far")
     # reasoning before the estimate: constrained decoding generates fields in this order
     explanation: str = Field(description="Clinical reasoning grounded in the triage algorithm")
@@ -43,8 +43,6 @@ class NurseOutput(_Output):
             raise ValueError("action 'utterance' needs a non-empty utterance")
         if self.action == "check_vital" and self.vital is None:
             raise ValueError("action 'check_vital' needs a vital")
-        if self.action == "log_red_flag" and not any(f.strip() for f in self.red_flags):
-            raise ValueError("action 'log_red_flag' needs at least one red flag")
         return self
 
 
@@ -81,21 +79,35 @@ class PatientOutput(_Output):
         return v
 
 
+# The nurse's triage record (its belief state), kept by the dialogue master from what the patient
+# says; vital signs are added as the nurse takes them.
+RECORD_FIELDS = {
+    "chief_complaint": "the main problem, in the patient's words",
+    "onset_and_course": "when and how it started, and how it has changed since",
+    "pain": "pain score (0-10), location and character",
+    "associated_symptoms": "other symptoms the patient has, and relevant ones they deny",
+    "relevant_history": "past medical history, earlier episodes or emergency visits",
+    "medications": "medicines the patient takes",
+    "allergies": "allergies, or that there are none",
+}
+
+
+RECORD_UNKNOWN = "needs information from patient"
+
+TriageRecord = create_model(
+    "TriageRecord",
+    __base__=_Output,
+    __doc__=f'The full triage record: every field\'s current value, or "{RECORD_UNKNOWN}".',
+    **{name: (str, Field(description=desc)) for name, desc in RECORD_FIELDS.items()},
+)
+
+
 class Reading(_Output):
-    """The dialogue master's reading of one utterance on its own, without any other context."""
+    """The dialogue master's reading of one exchange (the nurse's question and the patient's reply),
+    from its words alone: what the reply conveys, and the full triage record after it."""
 
-    conveyed: str = Field(description="One sentence: the information this utterance conveys")
-
-
-class BeliefExtraction(_Output):
-    """What the nurse learns from one patient reply."""
-
-    chief_complaint: Optional[str]
-    pain_severity: Optional[Literal["mild", "moderate", "severe"]]
-    pain_location: Optional[str]
-    duration: Optional[str]
-    symptoms: list[str]
-    red_flags: list[str]
+    conveyed: str = Field(description="One sentence: the information the patient's reply conveys")
+    record: TriageRecord
 
 
 # ─────────────────────────────────────────
@@ -117,10 +129,39 @@ class Verdict(_Output):
     faithful: bool = Field(description="true if the utterance passes the faithfulness check")
     informative: bool = Field(description="true if the utterance passes the informativeness check")
     in_persona: bool = Field(description="true if the utterance passes the persona check")
+    plausible: bool = Field(description="true if the utterance passes the plausibility check")
+    no_names: bool = Field(description="true if the utterance uses no personal names")
 
     @property
     def passed(self) -> bool:
-        return self.faithful and self.informative and self.in_persona
+        return self.faithful and self.informative and self.in_persona and self.plausible and self.no_names
+
+
+class NurseVerdict(Verdict):
+    """The dialogue master's check of one nurse utterance, which must also ask for one thing only."""
+
+    one_question: bool = Field(description="true if the utterance asks for one thing only")
+
+    @property
+    def passed(self) -> bool:
+        return super().passed and self.one_question
+
+
+class LineEdit(_Output):
+    """The dialogue master's own version of a line that failed its checks twice."""
+
+    utterance: str
+
+    @field_validator("utterance")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("empty utterance")
+        return v
+
+
+class PatientLineEdit(LineEdit):
+    disclosed: str = Field(description="One sentence: the information the edited line reveals")
 
 
 class PatientScript(_Output):

@@ -5,14 +5,14 @@ import pytest
 
 from triagesim.cases import Case
 from triagesim.personas import NursePersona, PatientPersona
-from triagesim.schemas import BeliefExtraction, InSitu, NurseOutput, PatientOutput, PatientScript, Reading, Verdict
+from triagesim.schemas import RECORD_FIELDS, RECORD_UNKNOWN, InSitu, LineEdit, NurseOutput, PatientOutput, PatientScript, Reading, Verdict
 
 
 def allowed(request, field):
     """Enum values the request's schema allows for a NurseOutput field."""
     prop = request.output_type.model_json_schema()["properties"][field]
     options = prop.get("anyOf", [prop])
-    return [v for o in options for v in o.get("enum", [])]
+    return [v for o in options for v in o.get("enum", [o["const"]] if "const" in o else [])]
 
 
 def reading(request):
@@ -35,24 +35,19 @@ def nurse_policy(request):
         return {**base, "action": "check_vital", "vital": "heartrate", "utterance": "Let me check your pulse."}
     if "log_red_flag" in actions and "[Vital] heartrate" in dialogue:
         return {**base, "action": "log_red_flag", "red_flags": ["Tachycardia", " tachycardia "]}
-    if dialogue.count("Patient:") >= 2:
+    if dialogue.count("Patient:") >= 2 and "end" in actions:
         return {**base, "action": "end", "triage": 2}
-    return {**base, "action": "utterance", "utterance": "Hi, I'm Sam. What brings you in?"}
+    return {**base, "action": "utterance", "utterance": "Hello. What brings you in today?"}
 
 
 def patient_policy(request):
     return {"utterance": "I fainted this morning.", "disclosed": "I fainted this morning."}
 
 
-def belief_policy(request):
-    return {
-        "chief_complaint": "fainting",
-        "pain_severity": None,
-        "pain_location": None,
-        "duration": "since this morning",
-        "symptoms": ["dizziness"],
-        "red_flags": [],
-    }
+def reader_policy(request):
+    """The dialogue master's reading of an exchange: what it conveyed and what it adds to the record."""
+    record = dict.fromkeys(RECORD_FIELDS, RECORD_UNKNOWN) | {"chief_complaint": "fainted this morning"}
+    return {"conveyed": "The patient fainted this morning.", "record": record}
 
 
 SCRIPT = {
@@ -63,20 +58,33 @@ SCRIPT = {
 }
 
 
+def verdict(request, critique="fine", **checks):
+    """The dialogue master's answer for the requested verdict type: every check passes unless given."""
+    return {"critique": critique, **{name: checks.get(name, True) for name in request.output_type.model_fields if name != "critique"}}
+
+
 def judge_policy(request):
-    return {"critique": "fine", "faithful": True, "informative": True, "in_persona": True}
+    return verdict(request)
+
+
+def editor_policy(request):
+    """The dialogue master's own version of a line that failed twice."""
+    edit = {"utterance": "Edited by the master."}
+    return edit | {"disclosed": "x"} if "disclosed" in request.output_type.model_fields else edit
 
 
 class FakeBackend:
     """Backend that answers with policies keyed on the requested output type."""
 
-    def __init__(self, model="fake", nurse=nurse_policy, patient=patient_policy, belief=belief_policy,
-                 judge=judge_policy, reader=lambda r: {"conveyed": "The patient fainted this morning."},
+    batched = True  # driven in rounds, like in-process vLLM
+
+    def __init__(self, model="fake", nurse=nurse_policy, patient=patient_policy,
+                 judge=judge_policy, reader=reader_policy, editor=editor_policy,
                  in_situ=lambda r: {"reasoning": "walk-in, talking", "conversation": True}, script=lambda r: SCRIPT):
         self.model = model
         self.policies = {
-            NurseOutput: nurse, PatientOutput: patient, BeliefExtraction: belief,
-            Verdict: judge, Reading: reader, InSitu: in_situ, PatientScript: script,
+            NurseOutput: nurse, PatientOutput: patient,
+            Verdict: judge, Reading: reader, InSitu: in_situ, PatientScript: script, LineEdit: editor,
         }
         self.batches = []
         self.usage = Counter()

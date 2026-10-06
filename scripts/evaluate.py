@@ -22,6 +22,8 @@ def main():
     p.add_argument("--patient-model")
     p.add_argument("--judge-model", help="dialogue master (default: none)")
     p.add_argument("--vllm-args", type=json.loads, default={"max_model_len": 16384, "language_model_only": True})
+    p.add_argument("--model-args", type=json.loads, default={},
+                   help="JSON kwargs for single models, keyed by model spec and merged over --vllm-args")
     p.add_argument("--data-dir", default="data")
     p.add_argument("--datasets", nargs="+", default=["esi", "etek", "mimic"])
     p.add_argument("--limit", type=int, help="first N cases per dataset")
@@ -32,7 +34,7 @@ def main():
     n_vllm = len({s for s in specs.values() if s and s.startswith("vllm:")})
     backends = {None: None}
     for spec in set(specs.values()) - {None}:
-        kwargs = dict(args.vllm_args) if spec.startswith("vllm:") else {}
+        kwargs = {**(args.vllm_args if spec.startswith("vllm:") else {}), **args.model_args.get(spec, {})}
         if spec.startswith("vllm:") and n_vllm > 1:
             kwargs.setdefault("gpu_memory_utilization", round(0.9 / n_vllm, 2))
         backends[spec] = load_backend(spec, **kwargs)
@@ -53,7 +55,6 @@ def main():
                 judge_llm=backends[specs["judge"]],
                 nurse_personas=nurses,
                 patient_personas=patients,
-                extract_beliefs=False,
             )
         )
         with (out_dir / f"{name}.jsonl").open("w") as f:

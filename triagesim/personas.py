@@ -134,11 +134,11 @@ PATIENT_TRAITS: dict[str, Trait] = {
         "Arbuckle 1993; Wang 2024",
     ),
     "disfluency": Trait(
-        "Speech disfluency: fillers (um, uh) and self-repairs.",
+        "Speech disfluency: repetitions, filled pauses, insertions, substitutions and speech errors.",
         {
-            "low": "rarely uses fillers or self-corrections",
-            "moderate": "uses some fillers and self-corrections",
-            "high": "uses frequent fillers, false starts and self-repairs",
+            "low": "mostly fluent: an occasional filled pause",
+            "moderate": "some filled pauses and repetitions, and an occasional insertion, substitution or speech error",
+            "high": "frequent filled pauses and repetitions, and regular insertions, substitutions and speech errors",
         },
         "Bortfeld 2001",
     ),
