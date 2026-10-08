@@ -284,14 +284,14 @@ They are set up for UNSW Katana; adjust the module and scratch paths for your cl
 If you use TriageSim in your research, please cite:
 
 ```bibtex
-@misc{srirag2026triagesimconversationalemergencytriage,
-      title={TriageSim: A Conversational Emergency Triage Simulation Framework from Structured Electronic Health Records}, 
-      author={Dipankar Srirag and Quoc Dung Nguyen and Aditya Joshi and Padmanesan Narasimhan and Salil Kanhere},
-      year={2026},
-      eprint={2603.10035},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2603.10035}, 
+@inproceedings{srirag26_interspeech,
+  title     = {{TriageSim: A Conversational Emergency Triage Simulation Framework from Structured Electronic Health Records}},
+  author    = {Dipankar Srirag and Quoc Dung Nguyen and Aditya Joshi and Padmanesan Narasimhan and Salil Kanhere},
+  year      = {2026},
+  booktitle = {{Interspeech 2026}},
+  pages     = {1997--2001},
+  doi       = {10.21437/Interspeech.2026-819},
+  issn      = {2958-1796},
 }
 ```
 

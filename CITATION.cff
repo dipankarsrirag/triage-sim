@@ -46,7 +46,7 @@ keywords:
   - large language models
 
 preferred-citation:
-  type: article
+  type: conference-paper
   title: "TriageSim: A Conversational Emergency Triage Simulation Framework from Structured Electronic Health Records"
   authors:
     - family-names: Srirag
@@ -60,5 +60,12 @@ preferred-citation:
       given-names: Padmanesan
     - family-names: Kanhere
       given-names: Salil
-  url: "https://arxiv.org/abs/2603.10035"
+  collection-title: "Proceedings of Interspeech 2026"
+  conference:
+    name: "Interspeech 2026"
+  start: 1997
+  end: 2001
+  doi: "10.21437/Interspeech.2026-819"
+  issn: "2958-1796"
+  url: "https://www.isca-archive.org/interspeech_2026/srirag26_interspeech.html"
   year: 2026
