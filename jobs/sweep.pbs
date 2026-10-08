@@ -1,0 +1,154 @@
+#!/bin/bash
+# Scale-up: simulate every case for a nurse/patient model pair, in 2-hour chunks that resume.
+# Run from a directory holding the code, data/ and <PAIR>.args (triagesim flags, one per line:
+# cases, personas, models, --model-args, --seed, ...); episodes go to <OUTDIR>/<PAIR>.jsonl:
+#   qsub -v PAIR=qwen-gemma31,OUTDIR=/srv/scratch/z5437514/triage-sim/outputs/sweep jobs/sweep.pbs
+# PAIR=<a>+<b> runs several pairs side by side on the same servers, e.g. a pair and its mirror
+# (qwen-gemma26+gemma26-qwen): each model's GPU then serves as nurse and master for one pair and as
+# the patient for the other, so neither GPU idles while the patient waits for the master.
+# The simulators stop STOP_BEFORE seconds (default 600) before the walltime: they get SIGINT and exit
+# at once, keeping the finished episodes (killed 120 s later if they hang). Once a chunk runs, the chain
+# continues until every pair is done: the job submits the next chunk with the pairs that added episodes
+# and either ran out of time (stopped or killed) or left failed episodes (in <PAIR>.errors.jsonl,
+# retried by the next chunk). A pair whose chunk adds nothing leaves the chain. Episodes in flight at
+# the stop are redone by the next chunk. Only one chunk per pair runs at a time (a lock next to its
+# output); a chunk leaves out pairs already running elsewhere. Each chunk adds a line per pair to
+# <PAIR>.chunks.tsv (episode counts before and after, exit status, engine settings).
+# GPUs too small for both models of a pair: SERVE=1 runs one `vllm serve` per model, each on its own GPU
+# (scripts/serve_args.py); SELECT sets the resources and is kept for the next chunks:
+#   qsub -l select=1:ncpus=16:ngpus=2:mem=128gb:gpu_model=L40S \
+#        -v PAIR=qwen-gemma26+gemma26-qwen,OUTDIR=...,SERVE=1,SELECT=1:ncpus=16:ngpus=2:mem=128gb:gpu_model=L40S jobs/sweep.pbs
+# CHAIN=0 never submits a next chunk (test runs).
+#PBS -N triagesim-sweep
+#PBS -l select=1:ncpus=8:ngpus=1:mem=128gb:gpu_model=H200
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /srv/scratch/z5437514/logs/
+
+# ---------------------------- environment: modules only ----------------------------
+# The vllm module already has everything triagesim needs (pydantic, openai, dotenv, yaml); the repo
+# goes on PYTHONPATH below. vllm/0.28.0: Gemma 4, transformers 5 (not on V100).
+module purge
+module use /srv/scratch/z5437514/apps/modulefiles
+module load python/3.13.2 ${VLLM_MODULE:-vllm/0.28.0}
+export PIP_REQUIRE_VIRTUALENV=1   # any `pip install` fails instead of silently changing the env
+export PYTHONNOUSERSITE=1         # ignore anything in ~/.local
+python3 -m pip check || exit 1   # stop now if the loaded modules disagree on versions
+
+# ------------- caches: per job on scratch, deleted together with the trash at exit -------------
+JOB_CACHE=/srv/scratch/z5437514/cache/${PBS_JOBID:-$$}
+export XDG_CACHE_HOME=$JOB_CACHE HF_HOME=$JOB_CACHE/huggingface TORCH_HOME=$JOB_CACHE/torch
+export HF_TOKEN_PATH=$HOME/.cache/huggingface/token   # keep `hf auth login` working across jobs
+# compiled GPU kernels are keyed by kernel/shape/GPU, not by model: kept across jobs (safe to delete anytime)
+COMPILE_CACHE=/srv/scratch/z5437514/cache/compile
+export TRITON_CACHE_DIR=$COMPILE_CACHE/triton CUDA_CACHE_PATH=$COMPILE_CACHE/nv \
+       FLASHINFER_WORKSPACE_BASE=$COMPILE_CACHE   # flashinfer ignores XDG and would cache into $HOME
+SERVERS=()
+cleanup() {
+    [ ${#SERVERS[@]} -gt 0 ] && kill "${SERVERS[@]}" 2>/dev/null
+    rm -rf "$JOB_CACHE" "$HOME/.local/share/Trash" "/srv/scratch/z5437514/.Trash-$(id -u)"
+}
+trap cleanup EXIT
+
+cd "$PBS_O_WORKDIR"
+# --------------------------------------- job ---------------------------------------
+export PYTHONPATH=$PBS_O_WORKDIR:$PYTHONPATH   # prepend: the modules put their packages here
+: "${PAIR:?qsub -v PAIR=<name> (reads <name>.args), or PAIR=<a>+<b> for pairs side by side}"
+OUTDIR=${OUTDIR:-$(dirname "${OUT:-outputs/sweep/x}")}   # OUT=<dir>/<pair>.jsonl: chunks queued by older versions
+mkdir -p "$OUTDIR"
+episodes() { if [ -f "$OUTDIR/$1.jsonl" ]; then grep -c . "$OUTDIR/$1.jsonl"; else echo 0; fi; }
+
+PAIRS=()
+for pair in ${PAIR//+/ }; do   # one lock per pair, held until the job ends
+    exec {fd}> "$OUTDIR/$pair.jsonl.lock"
+    if flock -n "$fd"; then PAIRS+=("$pair"); else echo "$pair: another chunk is running; leaving it out"; fi
+done
+[ ${#PAIRS[@]} -gt 0 ] || exit 0
+
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+if [ -n "$SERVE" ]; then   # one vllm serve per model, each on its own GPU, shared by the pairs
+    mkdir -p "$JOB_CACHE"
+    ARGFILES=() OVERRIDES=()
+    for pair in "${PAIRS[@]}"; do ARGFILES+=("$pair.args") OVERRIDES+=("$JOB_CACHE/$pair.serve.args"); done
+    python3 scripts/serve_args.py "${ARGFILES[@]}" --port $((20000 + RANDOM % 20000)) \
+        --plan "$JOB_CACHE/serve.plan" --overrides "${OVERRIDES[@]}" || exit 1
+    IFS=',' read -r -a GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+    PORTS=() i=0
+    while read -r port model_flags; do
+        log=/srv/scratch/z5437514/logs/sweep-$PAIR-${PBS_JOBID%%.*}-gpu$i.log
+        eval "CUDA_VISIBLE_DEVICES=${GPUS[$i]} vllm serve $model_flags --gpu-memory-utilization ${GPU_UTIL:-0.92} \
+            --disable-uvicorn-access-log > $log 2>&1 &"
+        SERVERS+=($!) PORTS+=("$port") i=$((i + 1))
+    done < "$JOB_CACHE/serve.plan"
+    for port in "${PORTS[@]}"; do
+        until curl -sf "http://127.0.0.1:$port/health" > /dev/null; do
+            for pid in "${SERVERS[@]}"; do
+                kill -0 "$pid" 2>/dev/null || { echo "a vllm server died; see logs/sweep-$PAIR-${PBS_JOBID%%.*}-gpu*.log"; exit 1; }
+            done
+            sleep 10
+        done
+    done
+    echo "servers up after ${SECONDS}s"
+fi
+
+# stop STOP_BEFORE seconds before the walltime, counting the time already spent (e.g. starting servers)
+WALL=$(qstat -f "$PBS_JOBID" | awk -F' = ' '/Resource_List.walltime/ {split($2, t, ":"); print t[1]*3600 + t[2]*60 + t[3]}')
+LIMIT=$(( ${WALL:-7200} - ${STOP_BEFORE:-600} - SECONDS ))
+declare -A BEFORE PIDS
+for pair in "${PAIRS[@]}"; do
+    BEFORE[$pair]=$(episodes "$pair")
+    ARGS=("@$pair.args")
+    [ -n "$SERVE" ] && ARGS+=("@$JOB_CACHE/$pair.serve.args")
+    (   # the pairs run side by side; each pair's log lines start with its name
+        timeout --signal=INT --kill-after=120 "$LIMIT" python3 -m triagesim "${ARGS[@]}" --out "$OUTDIR/$pair.jsonl" 2>&1 \
+            | sed -u "s/^/$pair: /"
+        exit "${PIPESTATUS[0]}"
+    ) &
+    PIDS[$pair]=$!
+done
+
+failed_episodes() {   # failed episodes not redone yet
+    python3 - "$1" <<'EOF'
+import json, sys
+from pathlib import Path
+
+def ids(path):
+    found = set()
+    for line in path.read_text().splitlines() if path.exists() else []:
+        try:
+            found.add(json.loads(line)["episode_id"])
+        except ValueError:  # a line cut off by the stop
+            pass
+    return found
+
+out = Path(sys.argv[1])
+print(len(ids(out.with_suffix(".errors.jsonl")) - ids(out)))
+EOF
+}
+
+status=0 NEXT=()
+for pair in "${PAIRS[@]}"; do
+    wait "${PIDS[$pair]}"
+    s=$?
+    [ "$s" -ne 0 ] && status=$s
+    out=$OUTDIR/$pair.jsonl
+    after=$(episodes "$pair")
+    failed=$(failed_episodes "$out")
+    echo "$pair: ${BEFORE[$pair]} -> $after episodes in $out (exit $s); failed episodes still to retry: $failed"
+    # provenance: which chunk wrote which lines of the output, with which engine settings
+    [ -f "$OUTDIR/$pair.chunks.tsv" ] || printf 'job\tended\tbefore\tafter\texit\tvllm_args\n' > "$OUTDIR/$pair.chunks.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${PBS_JOBID%%.*}" "$(date -Iseconds)" "${BEFORE[$pair]}" "$after" "$s" \
+        "$(grep -h '^--vllm-args=' "$pair.args" | tail -n 1 | cut -d= -f2-)" >> "$OUTDIR/$pair.chunks.tsv"
+    if [ "$after" -gt "${BEFORE[$pair]}" ] && { [ "$s" -eq 124 ] || [ "$s" -eq 137 ] || [ "$failed" -gt 0 ]; }; then
+        NEXT+=("$pair")
+    elif [ "$s" -eq 124 ] || [ "$s" -eq 137 ]; then
+        echo "$pair: no progress in this chunk; stopping its chain"
+    fi
+done
+
+if [ "${CHAIN:-1}" = 1 ] && [ ${#NEXT[@]} -gt 0 ]; then
+    next=$(IFS=+; echo "${NEXT[*]}")
+    qsub -N "sweep-${next//+/_}" ${SELECT:+-l select=$SELECT} \
+        -v PAIR="$next",OUTDIR="$OUTDIR",STOP_BEFORE="${STOP_BEFORE:-600}",SERVE="$SERVE",SELECT="$SELECT",GPU_UTIL="$GPU_UTIL" jobs/sweep.pbs
+fi
+exit $status

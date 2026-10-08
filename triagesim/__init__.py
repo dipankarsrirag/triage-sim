@@ -1,22 +1,28 @@
 """
 triagesim
 
-A multi-speaker spoken dialogue simulation framework for emergency
-department triage. Generates paired structured EHR → dialogue →
-accented speech data for speech and language research.
-
-Pipeline:
-  1. Structured data (MIMIC-IV-ED / ATS / ETEK) → simulation
-  2. Nurse ↔ patient dialogue via LLM agents
-  3. Phrase-break annotation for TTS
-  4. Speech synthesis via Qwen3-TTS (see scripts/)
+Simulated nurse <-> patient emergency department triage dialogues grounded in structured EHR
+cases (e.g. MIMIC-IV-ED), with LLM agents served by vLLM or OpenRouter.
 """
 
 from triagesim._version import __version__
-from triagesim.runner import TriageRunner, RunnerConfig
+from triagesim.cases import Case, load_cases
+from triagesim.llm import VLLM, OpenRouter, load_backend
+from triagesim.metrics import score, summarize
+from triagesim.personas import NursePersona, PatientPersona, load_personas
+from triagesim.simulation import simulate
 
 __all__ = [
     "__version__",
-    "TriageRunner",
-    "RunnerConfig",
+    "Case",
+    "load_cases",
+    "VLLM",
+    "OpenRouter",
+    "load_backend",
+    "NursePersona",
+    "PatientPersona",
+    "load_personas",
+    "simulate",
+    "score",
+    "summarize",
 ]

@@ -1,0 +1,80 @@
+#!/bin/bash
+# End-to-end check of both backends on a small model (run from the repo root):
+#   1. in-process vLLM (triagesim.VLLM)
+#   2. the OpenRouter client (triagesim.OpenRouter) against a local `vllm serve`, which speaks the
+#      same OpenAI-compatible API, so the request format is checked without an OpenRouter key
+#   qsub jobs/smoke_test.pbs                                   # vllm/0.28.0
+#   qsub -v VLLM_MODULE=vllm/0.18.0 jobs/smoke_test.pbs        # the system default stack
+# Uses only the vllm module (it already has pydantic, openai, dotenv, yaml) plus PYTHONPATH, so it
+# works with either vLLM stack. Outputs go to outputs/smoke-<jobid>/.
+#PBS -N triagesim-smoke
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb:gpu_model=A100
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -o /srv/scratch/z5437514/logs/
+
+# ---------------------------- environment: modules only ----------------------------
+module purge
+module use /srv/scratch/z5437514/apps/modulefiles
+module load python/3.13.2 ${VLLM_MODULE:-vllm/0.28.0}
+export PIP_REQUIRE_VIRTUALENV=1   # any `pip install` fails instead of silently changing the env
+export PYTHONNOUSERSITE=1         # ignore anything in ~/.local
+python3 -m pip check || exit 1   # stop now if the loaded modules disagree on versions
+
+# ------------- caches: per job on scratch, deleted together with the trash at exit -------------
+JOB_CACHE=/srv/scratch/z5437514/cache/${PBS_JOBID:-$$}
+export XDG_CACHE_HOME=$JOB_CACHE HF_HOME=$JOB_CACHE/huggingface TORCH_HOME=$JOB_CACHE/torch
+export HF_TOKEN_PATH=$HOME/.cache/huggingface/token   # keep `hf auth login` working across jobs
+# compiled GPU kernels are keyed by kernel/shape/GPU, not by model: kept across jobs (safe to delete anytime)
+COMPILE_CACHE=/srv/scratch/z5437514/cache/compile
+export TRITON_CACHE_DIR=$COMPILE_CACHE/triton CUDA_CACHE_PATH=$COMPILE_CACHE/nv \
+       FLASHINFER_WORKSPACE_BASE=$COMPILE_CACHE   # flashinfer ignores XDG and would cache into $HOME
+SERVER_PID=
+cleanup() {
+    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+    rm -rf "$JOB_CACHE" "$HOME/.local/share/Trash" "/srv/scratch/z5437514/.Trash-$(id -u)"
+}
+trap cleanup EXIT
+
+cd "$PBS_O_WORKDIR"
+# --------------------------------------- job ---------------------------------------
+export PYTHONPATH=$PBS_O_WORKDIR:$PYTHONPATH   # prepend: the modules put their packages here
+: "${MODEL:?qsub -v MODEL=/srv/scratch/z5437514/models/<name> jobs/smoke_test.pbs}"
+OUT=outputs/smoke-${PBS_JOBID%%.*}
+mkdir -p "$OUT"
+COMMON=(--cases examples/cases.jsonl
+        --nurse-personas examples/personas/nurse.yaml --patient-personas examples/personas/patient.yaml
+        --episodes-per-case 2
+        --sampling '{"nurse": {"temperature": 0.7, "top_p": 0.8, "top_k": 20},
+                     "patient": {"temperature": 0.7, "top_p": 0.8, "top_k": 20}}')
+
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+python3 -c "import vllm; print('vllm', vllm.__version__)"
+
+echo "=== 1. in-process vLLM"
+python3 -m triagesim --model "vllm:$MODEL" --out "$OUT/vllm.jsonl" \
+    --vllm-args '{"max_model_len": 16384, "language_model_only": true}' "${COMMON[@]}" || exit 1
+
+echo "=== 2. OpenRouter client against vllm serve"
+PORT=$((20000 + RANDOM % 20000))
+vllm serve "$MODEL" --served-model-name smoke --port "$PORT" --max-model-len 16384 \
+    --language-model-only > "$OUT/server.log" 2>&1 &
+SERVER_PID=$!
+until curl -sf "http://127.0.0.1:$PORT/health" > /dev/null; do
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "vllm serve died"; tail -50 "$OUT/server.log"; exit 1; }
+    sleep 5
+done
+python3 -m triagesim --model openrouter:smoke --out "$OUT/server.jsonl" \
+    --openrouter-args "{\"base_url\": \"http://127.0.0.1:$PORT/v1\", \"api_key\": \"EMPTY\", \"extra_body\": {}, \"max_workers\": 64}" \
+    "${COMMON[@]}" || exit 1
+
+echo "=== sample dialogue"
+python3 - "$OUT/vllm.jsonl" <<'EOF'
+import json, sys
+from triagesim.prompts import transcript
+ep = json.loads(open(sys.argv[1]).readline())
+print(ep["episode_id"], "| ground truth", ep["case"]["acuity"], "| final", ep["final_triage"], "|", ep["end_reason"])
+print(transcript(ep["history"]))
+print("red flags:", ep["red_flags"])
+print("record:", json.dumps(ep["record"], indent=1))
+EOF

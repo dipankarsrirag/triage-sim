@@ -1,0 +1,65 @@
+#!/bin/bash
+# Simulate triage dialogues with an in-process vLLM engine (run from the repo root):
+#   qsub -v MODEL=/srv/scratch/z5437514/models/gemma-4-E4B-it jobs/simulate.pbs
+#   qsub -v NURSE_MODEL=vllm:/path/to/a,PATIENT_MODEL=openrouter:org/model,OUT=outputs/pair.jsonl jobs/simulate.pbs
+#   qsub -v MODEL=...,CASES=data/mimic-iv-ed/triage.csv,OUT=outputs/mimic.jsonl,ARGS=@runs/mimic.args jobs/simulate.pbs
+# Re-submitting with the same OUT resumes where the last job stopped.
+# qsub -v rejects values with spaces or commas, so other triagesim flags go in ARGS: either one
+# space-free flag (ARGS=--episodes-per-case=4) or an @file with one flag per line, e.g.
+#   --algorithm=ats
+#   --sampling={"nurse": {"temperature": 0.7}}
+# Flags in ARGS come last, so they override the defaults below (including --vllm-args).
+#PBS -N triagesim
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb:gpu_model=H200
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /srv/scratch/z5437514/logs/triagesim.log
+
+# ---------------------------- environment: modules only ----------------------------
+# The vllm module already has everything triagesim needs (pydantic, openai, dotenv, yaml); the repo
+# goes on PYTHONPATH below. vllm/0.28.0: Gemma 4, transformers 5 (not on V100).
+module purge
+module use /srv/scratch/z5437514/apps/modulefiles
+module load python/3.13.2 ${VLLM_MODULE:-vllm/0.28.0}
+export PIP_REQUIRE_VIRTUALENV=1   # any `pip install` fails instead of silently changing the env
+export PYTHONNOUSERSITE=1         # ignore anything in ~/.local
+python3 -m pip check || exit 1   # stop now if the loaded modules disagree on versions
+
+# ------------- caches: per job on scratch, deleted together with the trash at exit -------------
+JOB_CACHE=/srv/scratch/z5437514/cache/${PBS_JOBID:-$$}
+export XDG_CACHE_HOME=$JOB_CACHE HF_HOME=$JOB_CACHE/huggingface TORCH_HOME=$JOB_CACHE/torch
+export HF_TOKEN_PATH=$HOME/.cache/huggingface/token   # keep `hf auth login` working across jobs
+# compiled GPU kernels are keyed by kernel/shape/GPU, not by model: kept across jobs (safe to delete anytime)
+COMPILE_CACHE=/srv/scratch/z5437514/cache/compile
+export TRITON_CACHE_DIR=$COMPILE_CACHE/triton CUDA_CACHE_PATH=$COMPILE_CACHE/nv \
+       FLASHINFER_WORKSPACE_BASE=$COMPILE_CACHE   # flashinfer ignores XDG and would cache into $HOME
+cleanup() {
+    rm -rf "$JOB_CACHE" "$HOME/.local/share/Trash" "/srv/scratch/z5437514/.Trash-$(id -u)"
+}
+trap cleanup EXIT
+
+cd "$PBS_O_WORKDIR"
+# --------------------------------------- job ---------------------------------------
+export PYTHONPATH=$PBS_O_WORKDIR:$PYTHONPATH   # prepend: the modules put their packages here
+# MODEL: one local model for every role; or NURSE_MODEL and PATIENT_MODEL as full specs
+# (vllm:<path> or openrouter:<id>; OpenRouter needs OPENROUTER_API_KEY in the environment or .env)
+if [ -n "$MODEL" ]; then
+    MODELS=(--model "vllm:$MODEL")
+    OUT=${OUT:-outputs/$(basename "$MODEL").jsonl}
+else
+    : "${NURSE_MODEL:?set MODEL, or NURSE_MODEL and PATIENT_MODEL}" "${PATIENT_MODEL:?set PATIENT_MODEL}" "${OUT:?set OUT}"
+    MODELS=(--nurse-model "$NURSE_MODEL" --patient-model "$PATIENT_MODEL")
+fi
+CASES=${CASES:-examples/cases.jsonl}
+# language_model_only skips the vision encoder of multimodal checkpoints (Qwen3.5, Gemma 4)
+[ -n "$VLLM_ARGS" ] || VLLM_ARGS='{"max_model_len": 16384, "language_model_only": true}'
+
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+python3 -m triagesim \
+    "${MODELS[@]}" \
+    --cases "$CASES" \
+    --nurse-personas "${NURSE_PERSONAS:-examples/personas/nurse.yaml}" \
+    --patient-personas "${PATIENT_PERSONAS:-examples/personas/patient.yaml}" \
+    --out "$OUT" \
+    --vllm-args "$VLLM_ARGS" \
+    $ARGS

@@ -1,0 +1,26 @@
+# Nurse personas (traits and levels: triagesim/personas.py, docs/persona-traits-review.md).
+# They shape the interview only, never the triage level. scripts/generate_personas.py generates the full pool.
+- gender: female
+  expertise: expert
+  algorithm_reliance: blended
+  risk_attitude: balanced
+  self_report_credence: corroborating
+  questioning_style: open_facilitative
+  emotional_responsiveness: acknowledging
+  workload: busy
+- gender: male
+  expertise: novice
+  algorithm_reliance: protocol_driven
+  risk_attitude: risk_averse
+  self_report_credence: accepting
+  questioning_style: closed_directive
+  emotional_responsiveness: empathic
+  workload: quiet
+- gender: female
+  expertise: competent
+  algorithm_reliance: intuition_led
+  risk_attitude: risk_accepting
+  self_report_credence: discounting
+  questioning_style: mixed
+  emotional_responsiveness: task_focused
+  workload: overloaded

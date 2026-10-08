@@ -17,17 +17,6 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
 
-    services:
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
     - uses: actions/checkout@v4
 
@@ -47,9 +36,9 @@ jobs:
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
-        flake8 triagesim tests --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 triagesim tests scripts --count --select=E9,F63,F7,F82 --show-source --statistics
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 triagesim tests --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        flake8 triagesim tests scripts --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
     - name: Test with pytest
       run: pytest -q

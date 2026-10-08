@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "triagesim"
-version = "0.1.1"
+version = "0.2.0"
 description = "Multi-speaker spoken dialogue simulation framework for emergency department triage"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -35,18 +35,18 @@ classifiers = [
 
 dependencies = [
     "pydantic>=2.9",
-    "pydantic-ai[openrouter]>=1.0",
+    "openai>=1.40",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
-redis = ["redis>=5.0"]
+vllm = ["vllm>=0.11"]
 audio = ["torch>=2.0", "TTS>=0.22"]
-dev = [
-    "pytest>=8.0",
-    "triagesim[redis]",
-]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+triagesim = "triagesim.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/dipankarsrirag/triage-sim"

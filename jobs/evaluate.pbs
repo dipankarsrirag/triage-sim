@@ -1,0 +1,53 @@
+#!/bin/bash
+# Triage evaluation on the seed datasets in data/ (see scripts/evaluate.py), run from the repo root:
+#   qsub -v MODEL=/srv/scratch/z5437514/models/gemma-4-E4B-it,OUT=outputs/eval/gemma4 jobs/evaluate.pbs
+# Pairing: NURSE_MODEL / PATIENT_MODEL take full specs (vllm:<path> or openrouter:<id>) instead of MODEL.
+# Several runs in one job (vLLM start-up costs minutes per job): RUNS=a:b runs evaluate.py once per
+# a.args, b.args (argument files with the models and flags), writing to $OUT/a, $OUT/b:
+#   qsub -v RUNS=gemma-qwen:qwen-gemma,OUT=outputs/eval/pairs jobs/evaluate.pbs
+#PBS -N triagesim-eval
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb:gpu_model=H200
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /srv/scratch/z5437514/logs/triagesim-eval.log
+
+# ---------------------------- environment: modules only ----------------------------
+# The vllm module already has everything triagesim needs (pydantic, openai, dotenv, yaml); the repo
+# goes on PYTHONPATH below. vllm/0.28.0: Gemma 4, transformers 5 (not on V100).
+module purge
+module use /srv/scratch/z5437514/apps/modulefiles
+module load python/3.13.2 ${VLLM_MODULE:-vllm/0.28.0}
+export PIP_REQUIRE_VIRTUALENV=1   # any `pip install` fails instead of silently changing the env
+export PYTHONNOUSERSITE=1         # ignore anything in ~/.local
+python3 -m pip check || exit 1   # stop now if the loaded modules disagree on versions
+
+# ------------- caches: per job on scratch, deleted together with the trash at exit -------------
+JOB_CACHE=/srv/scratch/z5437514/cache/${PBS_JOBID:-$$}
+export XDG_CACHE_HOME=$JOB_CACHE HF_HOME=$JOB_CACHE/huggingface TORCH_HOME=$JOB_CACHE/torch
+export HF_TOKEN_PATH=$HOME/.cache/huggingface/token   # keep `hf auth login` working across jobs
+# compiled GPU kernels are keyed by kernel/shape/GPU, not by model: kept across jobs (safe to delete anytime)
+COMPILE_CACHE=/srv/scratch/z5437514/cache/compile
+export TRITON_CACHE_DIR=$COMPILE_CACHE/triton CUDA_CACHE_PATH=$COMPILE_CACHE/nv \
+       FLASHINFER_WORKSPACE_BASE=$COMPILE_CACHE   # flashinfer ignores XDG and would cache into $HOME
+cleanup() {
+    rm -rf "$JOB_CACHE" "$HOME/.local/share/Trash" "/srv/scratch/z5437514/.Trash-$(id -u)"
+}
+trap cleanup EXIT
+
+cd "$PBS_O_WORKDIR"
+# --------------------------------------- job ---------------------------------------
+export PYTHONPATH=$PBS_O_WORKDIR:$PYTHONPATH   # prepend: the modules put their packages here
+: "${OUT:?qsub -v OUT=outputs/eval/<name>}"
+if [ -n "$MODEL" ]; then MODELS=(--model "vllm:$MODEL"); else MODELS=(--nurse-model "$NURSE_MODEL" --patient-model "$PATIENT_MODEL"); fi
+
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+if [ -n "$RUNS" ]; then
+    IFS=':' read -r -a NAMES <<< "$RUNS"
+    status=0
+    for name in "${NAMES[@]}"; do   # one failed run does not stop the others
+        echo "=== run $name"
+        python3 scripts/evaluate.py --out-dir "$OUT/$name" "@$name.args" || status=1
+    done
+    exit $status
+fi
+python3 scripts/evaluate.py "${MODELS[@]}" --out-dir "$OUT" $ARGS
