@@ -20,7 +20,7 @@ from triagesim.cases import load_cases
 from triagesim.llm import load_backend
 from triagesim.metrics import summarize
 from triagesim.personas import NursePersona, PatientPersona, load_personas
-from triagesim.simulation import simulate
+from triagesim.simulation import Features, simulate
 
 log = logging.getLogger("triagesim")
 
@@ -63,6 +63,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--episodes-per-case", type=int, default=1)
     p.add_argument("--limit", type=int, help="only use the first N cases")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--appearance", action="store_true",
+                   help="the dialogue master describes how the patient looks on arrival, for the nurse")
+    p.add_argument("--belief-state", action="store_true",
+                   help="show the nurse its last level, confidence, red flags and reasoning at each step")
+    p.add_argument("--feedback", action="store_true",
+                   help="the dialogue master tells the nurse how warm or cold its last level is (uses the ground truth)")
     p.add_argument("--concurrency", type=int, default=256, help="episodes in flight at once")
     return p
 
@@ -124,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         concurrency=args.concurrency,
         sampling=args.sampling,
         skip=done,
+        features=Features(appearance=args.appearance, belief_state=args.belief_state, feedback=args.feedback),
     )
 
     out.parent.mkdir(parents=True, exist_ok=True)

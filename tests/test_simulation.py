@@ -2,11 +2,13 @@ import threading
 import zlib
 
 import pytest
-from conftest import FakeBackend, allowed, nurse_policy, nurse_says, verdict
+from conftest import APPEARANCE, FakeBackend, allowed, nurse_policy, nurse_says, verdict
 
 from triagesim.cases import Case
 from triagesim.schemas import RECORD_FIELDS, RECORD_UNKNOWN, PatientOutput, PatientScript
-from triagesim.simulation import simulate
+from triagesim import prompts
+from triagesim.schemas import Appearance, NurseOutput
+from triagesim.simulation import Features, simulate
 
 
 def run(cases, backend, nurse_persona, patient_persona, **kwargs):
@@ -467,3 +469,57 @@ def test_a_nurse_line_asking_two_things_is_regenerated(case, nurse_persona, pati
     assert first["verification"]["rejected"][0]["verdict"]["one_question"] is False
     checks = [r.output_type.__name__ for b in backend.batches for r in b if r.output_type.__name__.endswith("Verdict")]
     assert "NurseVerdict" in checks and "Verdict" in checks  # only nurse lines get the one-question check
+
+
+def nurse_prompts(backend):
+    return [r.messages[1]["content"] for b in backend.batches for r in b if issubclass(r.output_type, NurseOutput)]
+
+
+def test_master_describes_the_appearance_for_the_nurse(backend, case, nurse_persona, patient_persona):
+    [ep] = run([case], backend, nurse_persona, patient_persona, judge_llm=backend, features=Features(appearance=True))
+    assert ep["appearance"] == APPEARANCE
+    order = [r.output_type.__name__ for b in backend.batches for r in b][:3]
+    assert order == ["InSitu", "PatientScript", "Appearance"]
+    asked = next(r for b in backend.batches for r in b if r.output_type is Appearance).messages[1]["content"]
+    assert "Syncope" in asked and "mental state: alert" in asked
+    assert "acuity" not in asked.lower() and "ESI" not in asked  # never the level
+    nurse_system = next(r for b in backend.batches for r in b if issubclass(r.output_type, NurseOutput)).messages[0]["content"]
+    assert "pale and sweaty" in nurse_system and "breathing fast" in nurse_system
+
+
+def test_an_appearance_with_judgements_is_retried_then_dropped(case, nurse_persona, patient_persona):
+    calls = []
+
+    def judging(request):
+        calls.append(request)
+        return {**APPEARANCE, "skin": "pale; looks critically unwell"}
+    fake = FakeBackend(appearance=judging)
+    [ep] = run([case], fake, nurse_persona, patient_persona, judge_llm=fake, features=Features(appearance=True))
+    assert len(calls) == 2 and "critically" in calls[1].messages[-1]["content"]  # retried with the reason
+    assert "appearance" not in ep and "critically" in ep["appearance_error"]
+    assert ep["status"] == "ok"  # the dialogue goes on with the plain view
+
+
+def test_the_nurse_sees_its_belief_state_from_the_second_step(backend, case, nurse_persona, patient_persona):
+    run([case], backend, nurse_persona, patient_persona, features=Features(belief_state=True))
+    seen = nurse_prompts(backend)
+    assert "YOUR BELIEF STATE" not in seen[0]
+    assert all("YOUR BELIEF STATE" in m and "level: ESI 3 (confidence: medium)" in m for m in seen[1:])
+
+
+def test_warm_cold_feedback_on_the_last_level(case, nurse_persona, patient_persona):
+    assert prompts.warmth([3], 2) == "Your last level, ESI 3, is warm."
+    assert prompts.warmth([4, 3], 2) == "Your last level, ESI 3, is warm: warmer than your level before it (ESI 4)."
+    assert prompts.warmth([2, 4], 2) == "Your last level, ESI 4, is cold: colder than your level before it (ESI 2)."
+    assert prompts.warmth([2, 2], 2) == "Your last level, ESI 2, is hot: as warm as your level before it (ESI 2)."
+    fake = FakeBackend()
+    [ep] = run([case], fake, nurse_persona, patient_persona, features=Features(feedback=True))
+    seen = nurse_prompts(fake)
+    assert "FEEDBACK ON YOUR LAST LEVEL" not in seen[0] and "ESI 3, is warm" in seen[1]  # case is ESI 2
+    assert "feedback" not in ep["trace"][0] and ep["trace"][1]["feedback"].startswith("Your last level, ESI 3, is warm")
+
+
+def test_features_are_off_by_default(backend, case, nurse_persona, patient_persona):
+    [ep] = run([case], backend, nurse_persona, patient_persona, judge_llm=backend)
+    assert "appearance" not in ep and not any("feedback" in t for t in ep["trace"])
+    assert not any("YOUR BELIEF STATE" in m or "FEEDBACK" in m for m in nurse_prompts(backend))

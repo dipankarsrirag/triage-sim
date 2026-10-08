@@ -5,7 +5,7 @@ import pytest
 
 from triagesim.cases import Case
 from triagesim.personas import NursePersona, PatientPersona
-from triagesim.schemas import RECORD_FIELDS, RECORD_UNKNOWN, InSitu, LineEdit, NurseOutput, PatientOutput, PatientScript, Reading, Verdict
+from triagesim.schemas import RECORD_FIELDS, RECORD_UNKNOWN, Appearance, InSitu, LineEdit, NurseOutput, PatientOutput, PatientScript, Reading, Verdict
 
 
 def allowed(request, field):
@@ -58,6 +58,13 @@ SCRIPT = {
 }
 
 
+APPEARANCE = {
+    "arrival": "walked in slowly, steadied by a friend", "breathing": "breathing fast, short sentences",
+    "skin": "pale and sweaty", "behaviour": "alert, answers straight away", "visible_distress": "grimacing",
+    "visible_injuries": None,
+}
+
+
 def verdict(request, critique="fine", **checks):
     """The dialogue master's answer for the requested verdict type: every check passes unless given."""
     return {"critique": critique, **{name: checks.get(name, True) for name in request.output_type.model_fields if name != "critique"}}
@@ -80,11 +87,13 @@ class FakeBackend:
 
     def __init__(self, model="fake", nurse=nurse_policy, patient=patient_policy,
                  judge=judge_policy, reader=reader_policy, editor=editor_policy,
-                 in_situ=lambda r: {"reasoning": "walk-in, talking", "conversation": True}, script=lambda r: SCRIPT):
+                 in_situ=lambda r: {"reasoning": "walk-in, talking", "conversation": True}, script=lambda r: SCRIPT,
+                 appearance=lambda r: APPEARANCE):
         self.model = model
         self.policies = {
             NurseOutput: nurse, PatientOutput: patient,
             Verdict: judge, Reading: reader, InSitu: in_situ, PatientScript: script, LineEdit: editor,
+            Appearance: appearance,
         }
         self.batches = []
         self.usage = Counter()

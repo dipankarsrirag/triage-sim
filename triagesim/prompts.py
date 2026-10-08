@@ -6,13 +6,14 @@ state (transcript, known vitals, allowed actions) in the user message, so every 
 episode shares a long cacheable prefix (vLLM prefix caching).
 """
 
+import re
 from typing import Optional
 
 from pydantic import BaseModel
 
 from triagesim.cases import Case
 from triagesim.personas import CASE_STATES, PatientPersona, Trait, traits_of
-from triagesim.schemas import RECORD_FIELDS, RECORD_UNKNOWN, VITALS, PatientScript
+from triagesim.schemas import RECORD_FIELDS, RECORD_UNKNOWN, VITALS, Appearance, PatientScript
 
 RULE = "────────────────────────────────────────"
 
@@ -77,12 +78,15 @@ def _record(record: Optional[dict], history: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def patient_view(case: Case, persona: PatientPersona) -> str:
-    """What the nurse can see at the triage desk."""
+def patient_view(case: Case, persona: PatientPersona, appearance: Optional[Appearance] = None) -> str:
+    """What the nurse can see at the triage desk: who the patient is, how they arrived and, if the
+    dialogue master described it, how they look."""
     lines = [f"- gender: {case.gender or persona.gender or 'not recorded'}", f"- age group: {persona.age_group}"]
     transport = str((case.model_extra or {}).get("arrival_transport") or "").lower()
     if transport and transport not in ("unknown", "other"):
         lines.append(f"- arrived by: {transport}")
+    if appearance is not None:
+        lines += [f"- {name.replace('_', ' ')}: {value}" for name, value in appearance.model_dump().items() if value]
     return "\n".join(lines)
 
 
@@ -416,6 +420,27 @@ def _nurse_system(persona: BaseModel, algorithm: str, patient: str) -> str:
     )
 
 
+def _belief(step: dict) -> str:
+    """The nurse's last assessment: level, confidence, red flags and reasoning."""
+    flags = "; ".join(step.get("red_flags") or []) or "none"
+    return (f"- level: ESI {step['triage']} (confidence: {step['confidence']})\n- red flags so far: {flags}\n"
+            f"- your reasoning: {step.get('explanation') or 'none'}")
+
+
+def warmth(levels: list[int], truth: int) -> str:
+    """Warm/cold feedback on the last of `levels` against the ground truth, and whether it is warmer or
+    colder than the level before it."""
+    def word(level: int) -> str:
+        d = abs(level - truth)
+        return "hot" if d == 0 else "warm" if d == 1 else "cold"
+    last = f"Your last level, ESI {levels[-1]}, is {word(levels[-1])}"
+    if len(levels) < 2:
+        return last + "."
+    before, now = abs(levels[-2] - truth), abs(levels[-1] - truth)
+    trend = "warmer than" if now < before else "colder than" if now > before else "as warm as"
+    return f"{last}: {trend} your level before it (ESI {levels[-2]})."
+
+
 def nurse_messages(
     persona: BaseModel,
     algorithm: str,
@@ -428,6 +453,8 @@ def nurse_messages(
     record: Optional[dict] = None,
     deduce: Optional[str] = None,
     record_gaps: tuple[str, ...] = (),
+    belief: Optional[dict] = None,
+    feedback: Optional[str] = None,
 ) -> list[dict[str, str]]:
     action_help = "\n".join(ACTION_HELP[a].format(vitals=", ".join(vitals)) for a in actions)
     choices = ", ".join(f'"{a}"' for a in actions)
@@ -436,6 +463,14 @@ def nurse_messages(
         _section("YOUR TRIAGE RECORD (what you have established so far; work through the triage algorithm "
                  "and use your questions to fill in as much of it as you can)", _record(record, history)),
     ]
+    if belief is not None:
+        sections.append(_section("YOUR BELIEF STATE (your last assessment; update it with every new answer)", _belief(belief)))
+    if feedback is not None:
+        sections.append(_section(
+            "DIALOGUE MASTER'S FEEDBACK ON YOUR LAST LEVEL (private: never mention it, or any triage level, to the patient)",
+            feedback + "\nhot = your last level is the right one; warm = one level away; cold = two or more levels "
+            "away. Warmer or colder compares it with your level before it. Use it to decide what to ask next.",
+        ))
     if deduce:
         sections.append(_section(
             "INFER A VITAL SIGN",
@@ -755,6 +790,38 @@ def in_situ_messages(case: Case) -> list[dict[str, str]]:
         {"role": "system", "content": IN_SITU_SYSTEM},
         {"role": "user", "content": _section("ON ARRIVAL", "\n".join(_arrival_facts(case)))},
     ]
+
+
+APPEARANCE_SYSTEM = """You are the dialogue master of a simulated emergency department triage. Describe what the
+triage nurse sees when this patient reaches the triage desk, before anyone speaks, from the facts below
+only: how the patient arrives and moves, how they breathe and talk, their skin, their alertness and
+behaviour, visible pain or distress, and any visible injury, bleeding, swelling or rash.
+
+Write observations a nurse could see, in plain words, never judgements: no numbers, no vital-sign
+values, no diagnoses or conditions, no triage levels, and no words such as "critical", "unstable",
+"stable", "urgent", "serious" or "emergency". Show abnormal vital signs only as signs a nurse could see
+(for example fast breathing, bluish lips, pale and clammy skin, flushed and sweaty); with normal vital
+signs, show nothing unusual about them. Show pain as the patient's body shows it (grimacing, guarding,
+holding the painful part, limping), and the mental state and intoxication given below as behaviour.
+Keep each field short."""
+
+# what the appearance must never contain: numbers, levels, diagnoses' usual judgements of urgency
+APPEARANCE_BANNED = re.compile(
+    r"\d|\b(?:ESI|triage|level|priority|critical\w*|unstable|stable|urgent\w*|emergen\w*|serious\w*|"
+    r"life[- ]threatening|resuscitat\w*|deteriorat\w*|diagnos\w*)\b", re.I)
+
+
+def appearance_messages(case: Case, persona: PatientPersona, script: Optional[PatientScript]) -> list[dict[str, str]]:
+    """What is visible on arrival (complaint, arrival, vital signs, pain), the mental state and
+    intoxication the case supports, and the visible persona traits; no acuity, diagnoses or history."""
+    facts = _arrival_facts(case)
+    facts += [f"- mental state: {script.cognitive_state if script else 'alert'}",
+              f"- intoxication: {script.intoxication if script else 'none'}"]
+    shown = {"age_group", "distress", "demeanour"}
+    traits = [_level(n, t, getattr(persona, n)) for n, t in traits_of(persona).items() if n in shown]
+    user = "\n\n".join([_section("ON ARRIVAL", "\n".join(facts)), _section("VISIBLE PERSONA TRAITS", "\n".join(traits)),
+                         "Describe what the nurse sees."])
+    return [{"role": "system", "content": APPEARANCE_SYSTEM}, {"role": "user", "content": user}]
 
 
 SCRIPT_SYSTEM = """You are the dialogue master of a simulated emergency department triage. You write the

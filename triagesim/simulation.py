@@ -23,6 +23,7 @@ from triagesim.schemas import (
     RECORD_FIELDS,
     RECORD_UNKNOWN,
     VITALS,
+    Appearance,
     InSitu,
     LineEdit,
     PatientLineEdit,
@@ -50,6 +51,17 @@ PLACEHOLDER = re.compile(
 
 Call = tuple[str, list[dict[str, str]], type]
 EpisodeGen = Generator[Call, Any, dict]
+
+
+@dataclass(frozen=True)
+class Features:
+    """Optional parts of the simulation: the dialogue master describes the patient's appearance for
+    the nurse (`appearance`); each nurse step shows the nurse its last assessment (`belief_state`) and
+    the master's warm/cold feedback on its last level against the ground truth (`feedback`)."""
+
+    appearance: bool = False
+    belief_state: bool = False
+    feedback: bool = False
 
 
 @dataclass
@@ -118,6 +130,7 @@ def _nurse_phase(
     record: dict,
     review: bool,
     max_regen: int,
+    features: Features = Features(),
 ):
     """Nurse micro-steps until it speaks or ends triage; returns True if it ended.
 
@@ -150,9 +163,12 @@ def _nurse_phase(
                 + (() if flag_logged else ("log_red_flag",))
                 + (("end",) if questions_before_end <= 0 and not gaps else ())
             )
+        belief = trace[-1] if features.belief_state and trace else None
+        feedback = (prompts.warmth([t["triage"] for t in trace], ep.case.acuity)
+                    if features.feedback and trace and ep.case.acuity is not None else None)
         messages = prompts.nurse_messages(
             ep.nurse_persona, ep.algorithm, ep.patient_view, history, actions, vitals, questions_left,
-            questions_before_end, record, deduce, gaps,
+            questions_before_end, record, deduce, gaps, belief, feedback,
         )
 
         context = {"algorithm": ep.algorithm, "patient": ep.patient_view}
@@ -172,7 +188,7 @@ def _nurse_phase(
             nurse_output_type(("utterance",), (), reading),
             (editor, LineEdit),
         )
-        trace.append({"turn": turn, **out.model_dump()})
+        trace.append({"turn": turn, **out.model_dump(), **({"feedback": feedback} if feedback else {})})
         if reading:
             unread["information"]["understood"] = out.understood
             unread = None
@@ -218,7 +234,8 @@ def _nurse_phase(
             return False
 
 
-def _run_episode(ep: _Episode, max_turns: int, min_questions: int, review: bool, max_regen: int) -> EpisodeGen:
+def _run_episode(ep: _Episode, max_turns: int, min_questions: int, review: bool, max_regen: int,
+                 features: Features = Features()) -> EpisodeGen:
     history: list[dict] = []
     trace: list[dict] = []
     red_flags: list[str] = []
@@ -254,12 +271,29 @@ def _run_episode(ep: _Episode, max_turns: int, min_questions: int, review: bool,
         except GenerationError as e:  # the patient improvises from the case instead
             setup["script_error"] = str(e)
     setup["patient_script"] = None if script is None else script.model_dump()
+    if review and features.appearance:  # what the nurse sees at the desk; without it, only who and how they came
+        messages = prompts.appearance_messages(ep.case, ep.patient_persona, script)
+        try:
+            for attempt in range(2):
+                look = yield "script", messages, Appearance
+                banned = sorted({m.group(0) for m in prompts.APPEARANCE_BANNED.finditer(" ".join(
+                    v for v in look.model_dump().values() if v))})
+                if not banned:
+                    setup["appearance"] = look.model_dump()
+                    ep.patient_view = prompts.patient_view(ep.case, ep.patient_persona, look)
+                    break
+                messages = prompts.with_feedback(messages, look.model_dump_json(),
+                                                 f"Observations only: remove {', '.join(banned)}.")
+            else:
+                setup["appearance_error"] = f"kept judgement words or numbers: {', '.join(banned)}"
+        except GenerationError as e:
+            setup["appearance_error"] = str(e)
 
     try:
         while True:  # after the last question the nurse may still check vitals (and infer missing ones), then ends
             ended = yield from _nurse_phase(
                 ep, history, trace, red_flags, turn, max(max_turns - turn, 0), min(min_questions, max_turns) - turn,
-                record, review, max_regen,
+                record, review, max_regen, features,
             )
             if ended:
                 break
@@ -345,6 +379,7 @@ def simulate(
     concurrency: int = 256,
     sampling: Optional[dict[str, dict]] = None,
     skip: Iterable[str] = (),
+    features: Features = Features(),
 ) -> Iterator[dict]:
     """Simulate triage episodes, yielding one artifact dict per episode as it finishes.
 
@@ -362,7 +397,8 @@ def simulate(
     nurse sees the record at every step; vital signs are added as they are taken). Cases without a
     ground-truth acuity are skipped. `sampling` overrides DEFAULT_SAMPLING per role ("nurse",
     "patient", "judge", "script"). Episodes whose LLM calls keep failing are yielded with status "error" and the
-    dialogue up to the failure.
+    dialogue up to the failure. `features` switches on the appearance (needs a dialogue master), the
+    nurse's belief state and the warm/cold feedback (logged on each nurse step as "feedback").
     """
     if algorithm is not None and algorithm not in prompts.ALGORITHMS:
         raise ValueError(f"unknown algorithm {algorithm!r}; expected one of {sorted(prompts.ALGORITHMS)}")
@@ -406,7 +442,7 @@ def simulate(
             """Start episodes up to `concurrency`; returns the ids of those now waiting on a call."""
             started = []
             while len(active) < concurrency and (ep := next(todo, None)) is not None:
-                gen = _run_episode(ep, max_turns, min_questions, review, max_regenerations)
+                gen = _run_episode(ep, max_turns, min_questions, review, max_regenerations, features)
                 try:
                     active[ep.episode_id] = [gen, next(gen), 0]
                     started.append(ep.episode_id)

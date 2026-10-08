@@ -164,6 +164,19 @@ class PatientLineEdit(LineEdit):
     disclosed: str = Field(description="One sentence: the information the edited line reveals")
 
 
+class Appearance(_Output):
+    """What the triage nurse sees when the patient reaches the desk: observations only (no numbers,
+    diagnoses, levels or judgements of urgency), written by the dialogue master from what is visible on
+    arrival."""
+
+    arrival: str = Field(description="How the patient arrives and moves, e.g. 'walked in slowly, holding the left arm'")
+    breathing: str = Field(description="How the patient breathes and talks, e.g. 'breathing fast, speaking in short phrases'")
+    skin: str = Field(description="Skin colour and moisture, e.g. 'pale and sweaty' or 'normal colour'")
+    behaviour: str = Field(description="Alertness and behaviour, e.g. 'alert, answers straight away' or 'drowsy, slow to respond'")
+    visible_distress: str = Field(description="Visible pain or distress, e.g. 'grimacing, guarding the abdomen' or 'none visible'")
+    visible_injuries: Optional[str] = Field(description="Visible injuries, bleeding, swelling or rash; null if none")
+
+
 class PatientScript(_Output):
     """Standardized-patient script: what this patient experienced, from their perspective."""
 
